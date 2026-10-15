@@ -122,13 +122,13 @@ def coin_info(mint):
         if a: sym = (a.get("content", {}).get("metadata") or {}).get("symbol")
     return sym or "UNKNOWN", mc, ath
 
-def format_alert(c, mint, sig):
+def format_alert(c, mint, sig, kind="FIRST claim ever"):
     login, name = github_login(c["user_id"])
     sym, mc, ath = coin_info(mint) if mint else ("UNKNOWN", None, None)
     who = f"{login}" + (f" ({name})" if name else "") if login else f"GitHub id {c['user_id']}"
     gh = f"https://github.com/{login}" if login else f"https://api.github.com/user/{c['user_id']}"
     lines = [f"${sym}", mint or "(mint not resolved)", f"• MC: {compact(mc)} ATH: {compact(ath)[1:] if ath else 'n/a'}",
-             f"• 🐙 FIRST claim by GitHub {who}: {c['amount']/1e9:.2f} SOL",
+             f"• 🐙 {kind} by GitHub {who}: {c['amount']/1e9:.2f} SOL",
              (f"pump.fun: https://pump.fun/coin/{mint}\n" if mint else "") + f"GitHub: {gh}\nTx: https://solscan.io/tx/{sig}"]
     return "\n".join(lines)
 
@@ -194,20 +194,95 @@ def tg_supervisor():
         except BaseException as e: log.exception("tg poll crashed: %s", e)
         time.sleep(5)
 
-def handle_sig(sig, send=True):
-    if sig in state["seen"]: return None
+LINK_WINDOW = 300          # distribute counts as "claimed from mint" if within 5 min before a claim
+HIST_MAX_TX = int(os.environ.get("HIST_MAX_TX", "150"))   # cap getTransaction calls per history scan
+
+def tx_events(t, pda):
+    """(distributed mints for this vault, is_claim) for one tx."""
+    keys = tx_keys(t); mints = []; claim = False
+    for ix in all_ix(t):
+        p = keys[ix["programIdIndex"]]; raw = base58.b58decode(ix["data"])
+        if p == PUMP_PROG and raw[:8] == DISTRIBUTE:
+            accts = [keys[a] for a in ix["accounts"]]
+            if pda in accts: mints.append(accts[0])
+        elif p == FEE_PROG and raw[:8] == EVENT_CPI and raw[8:16] == EV_CLAIMED:
+            claim = True
+    return mints, claim
+
+def vault_history(pda, before_sig):
+    """Scan the vault's txs older than before_sig (cached per vault). Returns cache dict."""
+    vh = state.setdefault("vault_hist", {}).setdefault(pda, {"newest": None, "oldest": None, "complete": False, "dists": [], "claims": []})
+    budget = HIST_MAX_TX
+    def scan(params):
+        nonlocal budget
+        sigs_all = []
+        while True:
+            page = rpc("getSignaturesForAddress", [pda, dict(limit=1000, **params)]) or []
+            sigs_all += page
+            if len(page) < 1000: return sigs_all, True
+            params = {**params, "before": page[-1]["signature"]}
+            if len(sigs_all) >= 5000: return sigs_all, False
+    def ingest(sigs):
+        nonlocal budget
+        done = 0
+        for s in sigs:
+            if s.get("err"): done += 1; continue
+            if budget <= 0: break
+            t = get_tx(s["signature"]); budget -= 1; done += 1
+            if not t: continue
+            mints, claim = tx_events(t, pda); bt = t.get("blockTime") or 0
+            for m in mints: vh["dists"].append([m, bt])
+            if claim: vh["claims"].append(bt)
+        return done
+    # newer-than-cache part (between cached newest and the current tx)
+    if vh["newest"]:
+        sigs, _ = scan({"before": before_sig, "until": vh["newest"]})
+        n = ingest(sigs)
+        if n < len(sigs): vh["complete"] = False   # gap left; mark partial
+        if sigs and n == len(sigs): vh["newest"] = sigs[0]["signature"]
+    else:
+        sigs, full = scan({"before": before_sig})
+        n = ingest(sigs)
+        vh["newest"] = before_sig
+        vh["complete"] = full and n == len(sigs)
+        vh["oldest"] = sigs[n-1]["signature"] if n else None
+    log.info("vault %s history: %d dists, %d claims, complete=%s, tx fetched=%d", pda[:8], len(vh["dists"]), len(vh["claims"]), vh["complete"], HIST_MAX_TX - budget)
+    save_state(state)
+    return vh
+
+def claimed_mint_before(vh, mint):
+    for m, bt in vh["dists"]:
+        if m == mint and any(0 <= c - bt <= LINK_WINDOW for c in vh["claims"]): return True
+    return False
+
+def evaluate(sig, t, c):
+    """Return (kind, mint) for an alert, or (None, mint)."""
+    mint = resolve_mint(t, sig, c["pda"])
+    pairs = state.setdefault("pairs", [])
+    key = f'{c["user_id"]}:{mint}'
+    if c["amount"] == c["lifetime"] and c["amount"] > 0: return "FIRST claim ever", mint, key
+    if not mint: return None, mint, key
+    if key in pairs: return None, mint, key
+    vh = vault_history(c["pda"], sig)
+    if claimed_mint_before(vh, mint): return None, mint, key
+    return ("FIRST claim on this token" if vh["complete"] else "FIRST claim on this token (unverified)"), mint, key
+
+def handle_sig(sig, send=True, prefix=""):
+    if send and sig in state["seen"]: return None
     t = get_tx(sig)
     if not t or t["meta"].get("err"): return None
     msgs = []
     for c in decode_claims(t):
-        first = c["amount"] == c["lifetime"] and c["amount"] > 0
-        log.info("claim %s user=%s amt=%.3f lifetime=%.3f first=%s", sig[:12], c["user_id"], c["amount"]/1e9, c["lifetime"]/1e9, first)
-        if not first or c["platform"] != 2: continue
-        mint = resolve_mint(t, sig, c["pda"])
-        text = format_alert(c, mint, sig); msgs.append(text); log.info("ALERT\n%s", text)
+        if c["platform"] != 2: continue
+        kind, mint, key = evaluate(sig, t, c)
+        log.info("claim %s user=%s mint=%s amt=%.3f lifetime=%.3f -> %s", sig[:12], c["user_id"], mint, c["amount"]/1e9, c["lifetime"]/1e9, kind)
+        if send and mint and key not in state["pairs"]: state["pairs"].append(key)
+        if not kind: continue
+        text = prefix + format_alert(c, mint, sig, kind); msgs.append(text); log.info("ALERT\n%s", text)
         if send: tg_send_all(text)
     if send:
-        state["seen"] = (state["seen"] + [sig])[-2000:]; save_state(state)
+        state["seen"] = (state["seen"] + [sig])[-2000:]
+    save_state(state)
     return msgs
 
 async def ws_loop():
@@ -232,13 +307,11 @@ def main():
                         handlers=[logging.FileHandler(os.path.join(DIR, "bot.log")), logging.StreamHandler()])
     logging.getLogger("websockets").setLevel(logging.WARNING)
     if len(sys.argv) > 2 and sys.argv[1] == "--replay":
-        sig = sys.argv[2]; t = get_tx(sig)
-        for c in decode_claims(t):
-            text = format_alert(c, resolve_mint(t, sig, c["pda"]), sig)
-            text = "🧪 TEST (replay of past claim)\n" + text
+        msgs = handle_sig(sys.argv[2], send=False, prefix="🧪 TEST (replay of past claim)\n")
+        if not msgs: print("NO ALERT for", sys.argv[2][:12]); return
+        for text in msgs:
             print(text)
-            if state["subscribers"]: tg_send_all(text); print("sent to", len(state["subscribers"]), "subscriber(s)")
-            else: print("(no subscribers yet; not sent)")
+            if "--send" in sys.argv and state["subscribers"]: tg_send_all(text); print("sent to", len(state["subscribers"]))
         return
     threading.Thread(target=tg_supervisor, daemon=True).start()
     asyncio.run(ws_loop())
