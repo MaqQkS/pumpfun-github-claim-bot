@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """pump.fun GitHub social-fee FIRST-claim alert bot."""
-import asyncio, base64, json, logging, os, struct, sys, threading, time
+import asyncio, html, re, base64, json, logging, os, struct, sys, threading, time
 import base58, requests, websockets
 
 HELIUS = os.environ["HELIUS_API_KEY"]; TG = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -142,32 +142,40 @@ def coin_info(mint):
         if a: sym = (a.get("content", {}).get("metadata") or {}).get("symbol")
     return sym or "UNKNOWN", mc, ath
 
+E = html.escape
+def _hdr(sym, mint, mc, ath):
+    ca = f"<code>{E(mint)}</code>" if mint else "(mint not resolved)"
+    return f"${E(str(sym))}\n{ca}\n• MC: {E(compact(mc))} ATH: {E(compact(ath)[1:]) if ath else 'n/a'}"
+
 def format_alert(c, mint, sig, kind="FIRST claim ever"):
+    """Returns Telegram HTML."""
     login, name = github_login(c["user_id"])
+    who = (login + (f" ({name})" if name else "")) if login else f"GitHub id {c['user_id']}"
+    gh = f"https://github.com/{login}" if login else f"https://api.github.com/user/{c['user_id']}"
+    amt = f"{c['amount']/1e9:.2f} SOL"
     if not mint:
         cands = vault_mints(c["pda"])
         if cands:
-            lines = []
-            for m in cands[:5]:
-                sy, mc_, at = coin_info(m)
-                lines.append(f"${sy}\n{m}\n• MC: {compact(mc_)} ATH: {compact(at)[1:] if at else 'n/a'}")
-            login, name = github_login(c["user_id"]); who = login or f"GitHub id {c['user_id']}"
-            return "\n\n".join(lines) + f"\n• 🐙 {kind} by GitHub {who}: {c['amount']/1e9:.2f} SOL (token ambiguous: vault is in {len(cands)} fee configs)\nGitHub: https://github.com/{login}\nTx: https://solscan.io/tx/{sig}"
+            blocks = [_hdr(*(lambda r: (r[0], m, r[1], r[2]))(coin_info(m))) for m in cands[:5]]
+            return "\n\n".join(blocks) + f"\n• 🐙 {E(kind)} by GitHub {E(who)}: {amt} (token ambiguous: vault is in {len(cands)} fee configs)\nGitHub: {E(gh)}\nTx: https://solscan.io/tx/{E(sig)}"
     sym, mc, ath = coin_info(mint) if mint else ("UNKNOWN", None, None)
-    who = f"{login}" + (f" ({name})" if name else "") if login else f"GitHub id {c['user_id']}"
-    gh = f"https://github.com/{login}" if login else f"https://api.github.com/user/{c['user_id']}"
-    lines = [f"${sym}", mint or "(mint not resolved)", f"• MC: {compact(mc)} ATH: {compact(ath)[1:] if ath else 'n/a'}",
-             f"• 🐙 {kind} by GitHub {who}: {c['amount']/1e9:.2f} SOL",
-             (f"pump.fun: https://pump.fun/coin/{mint}\n" if mint else "") + f"GitHub: {gh}\nTx: https://solscan.io/tx/{sig}"]
+    lines = [_hdr(sym, mint, mc, ath), f"• 🐙 {E(kind)} by GitHub {E(who)}: {amt}",
+             (f"pump.fun: https://pump.fun/coin/{E(mint)}\n" if mint else "") + f"GitHub: {E(gh)}\nTx: https://solscan.io/tx/{E(sig)}"]
     return "\n".join(lines)
+
+def html_to_plain(t):
+    return html.unescape(re.sub(r"</?code>", "", t))
 
 def tg_send_all(text):
     for chat in list(state["subscribers"]):
         try:
-            r = requests.post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=15)
+            r = requests.post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
             if r.status_code == 403:
-                state["subscribers"].remove(chat); save_state(state); log.info("removed blocked chat %s", chat)
-            elif not r.ok: log.warning("tg send %s: %s", chat, r.text[:200])
+                state["subscribers"].remove(chat); save_state(state); log.info("removed blocked chat %s", chat); continue
+            if not r.ok:
+                log.warning("tg HTML send %s failed: %s; retrying plain", chat, r.text[:200])
+                r = requests.post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": html_to_plain(text), "disable_web_page_preview": True}, timeout=15)
+                if not r.ok: log.warning("tg plain send %s: %s", chat, r.text[:200])
         except Exception as e: log.warning("tg send error: %s", e)
 
 def tg_reply(chat, text):
