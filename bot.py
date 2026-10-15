@@ -5,7 +5,13 @@ import base58, requests, websockets
 
 HELIUS = os.environ["HELIUS_API_KEY"]; TG = os.environ["TELEGRAM_BOT_TOKEN"]
 RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS}"
-WSS = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS}"
+WSS = os.environ.get("LOGS_WSS") or f"wss://mainnet.helius-rpc.com/?api-key={HELIUS}"
+WSS_NAME = "custom" if os.environ.get("LOGS_WSS") else "helius"
+# Every social-fee claim is co-signed by pump.fun's social_claim_authority. Subscribing to logs that mention it
+# (instead of the whole fee program, which is CPI'd by EVERY pump.fun trade, ~1 MB/s) cuts the stream to ~claims only.
+WS_MENTION = os.environ.get("WS_MENTION", "2sMrGNK8i36YRkF5WWCwnaUYuwDJhHe1g2xA8aPvhkjM")
+WS_BYTES = [0]
+FEE_GLOBAL = "CHqnuTkj6sXDFknM652aEFPECZh9qVsBXWkhPohmV9dA"  # PDA ["fee-program-global"]
 TGAPI = f"https://api.telegram.org/bot{TG}"
 FEE_PROG = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ"
 PUMP_PROG = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -25,19 +31,34 @@ def save_state(s):
         tmp = STATE + ".tmp"; json.dump(s, open(tmp, "w")); os.replace(tmp, STATE)
 state = load_state()
 
-def rpc(method, params, tries=4):
+from collections import Counter
+CALLS = Counter()          # per-method Helius call counter (logged hourly)
+CREDIT_COST = {"getProgramAccounts": 10, "getAsset": 10}
+def rpc(method, params, tries=3):
     for i in range(tries):
+        CALLS[method] += 1
         try:
             r = requests.post(RPC, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=20)
+            if r.status_code == 429 or r.status_code >= 500: raise IOError(f"HTTP {r.status_code}")
             j = r.json()
-            if "error" in j: raise RuntimeError(j["error"])
+            if "error" in j:  # deterministic RPC error: do not retry
+                log.warning("rpc %s error (no retry): %s", method, str(j["error"])[:160]); CALLS[method + ":error"] += 1
+                return None
             return j["result"]
         except Exception as e:
-            log.warning("rpc %s failed (%s), retry %d", method, str(e)[:120], i); time.sleep(1.5 * (i + 1))
+            log.warning("rpc %s failed (%s), retry %d", method, str(e)[:120], i); time.sleep(2 * (i + 1))
     return None
 
+def log_usage_loop():
+    start = time.time()
+    while True:
+        time.sleep(3600)
+        credits = sum(n * CREDIT_COST.get(m, 1) for m, n in CALLS.items() if ":" not in m)
+        log.info("USAGE since start (%.1fh): %s | est RPC credits=%d, ws bytes=%d (~%d credits)",
+                 (time.time() - start) / 3600, dict(CALLS), credits, WS_BYTES[0], WS_BYTES[0] * 20 // 1_000_000)
+
 def get_tx(sig):
-    for _ in range(6):  # tx may not be queryable for a moment after the log
+    for _ in range(4):  # tx may not be queryable for a moment after the log
         t = rpc("getTransaction", [sig, {"encoding": "json", "maxSupportedTransactionVersion": 1, "commitment": "confirmed"}])
         if t: return t
         time.sleep(2)
@@ -322,15 +343,28 @@ def handle_sig(sig, send=True, prefix=""):
     save_state(state)
     return msgs
 
+def authority_check_loop():
+    """Every 6h verify pump.fun's social_claim_authority is still WS_MENTION (1 credit)."""
+    while True:
+        res = rpc("getAccountInfo", [FEE_GLOBAL, {"encoding": "base64"}])
+        if res and res.get("value"):
+            data = base64.b64decode(res["value"]["data"][0])
+            if base58.b58decode(WS_MENTION) not in data:
+                log.error("social_claim_authority CHANGED: %s not in fee_program_global. Update WS_MENTION!", WS_MENTION)
+                tg_send_all("⚠️ GitClaimed bot: pump.fun social claim authority changed; claim detection may be blind. Check the bot.")
+            else: log.info("authority check ok")
+        time.sleep(6 * 3600)
+
 async def ws_loop():
     backoff = 1
     while True:
         try:
             async with websockets.connect(WSS, ping_interval=30, ping_timeout=20, max_size=2**22) as ws:
                 await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
-                                          "params": [{"mentions": [FEE_PROG]}, {"commitment": "confirmed"}]}))
-                log.info("ws connected, subscribed to %s logs", FEE_PROG); backoff = 1
+                                          "params": [{"mentions": [WS_MENTION]}, {"commitment": "confirmed"}]}))
+                log.info("ws connected (%s), logs mentioning %s", WSS_NAME, WS_MENTION); backoff = 1
                 async for raw in ws:
+                    WS_BYTES[0] += len(raw)
                     v = json.loads(raw).get("params", {}).get("result", {}).get("value")
                     if not v or v.get("err"): continue
                     if not any("Instruction: ClaimSocialFeePda" in l for l in v.get("logs", [])): continue
@@ -351,6 +385,8 @@ def main():
             if "--send" in sys.argv and state["subscribers"]: tg_send_all(text); print("sent to", len(state["subscribers"]))
         return
     threading.Thread(target=tg_supervisor, daemon=True).start()
+    threading.Thread(target=log_usage_loop, daemon=True).start()
+    threading.Thread(target=authority_check_loop, daemon=True).start()
     asyncio.run(ws_loop())
 
 if __name__ == "__main__": main()

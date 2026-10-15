@@ -19,3 +19,6 @@ Replay/test a past claim: `.venv/bin/python bot.py --replay <signature>` (sends 
 - Decodes the `SocialFeePdaClaimed` event; first claim = `amount_claimed == lifetime_claimed`, platform 2 (GitHub).
 - Mint from pump `distribute_creator_fees` (same tx or a prior tx on the same vault within 5 min).
 - Ticker/MC/ATH from pump.fun `frontend-api-v3.pump.fun/coins-v2/<mint>`, fallback DexScreener / Helius getAsset.
+
+## Credit usage
+The log stream subscribes to `mentions: [social_claim_authority 2sMrGNK8…]` (co-signer of every social-fee claim), NOT the whole fee program (the fee program is CPI'd by every pump.fun trade: ~500 msgs/s, ~1 MB/s ≈ 20 Helius credits/s). Override with `WS_MENTION`; use any other websocket via `LOGS_WSS` (e.g. `wss://api.mainnet-beta.solana.com`). Authority is re-checked every 6h; hourly `USAGE` lines in bot.log show per-method call counts.
