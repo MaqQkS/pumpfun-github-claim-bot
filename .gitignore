@@ -1,0 +1,8 @@
+.venv/
+node_modules/
+sdk/
+__pycache__/
+state.json
+state.json.tmp
+*.log
+.env
