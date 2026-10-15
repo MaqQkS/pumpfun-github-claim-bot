@@ -141,26 +141,58 @@ def tg_send_all(text):
             elif not r.ok: log.warning("tg send %s: %s", chat, r.text[:200])
         except Exception as e: log.warning("tg send error: %s", e)
 
+def tg_reply(chat, text):
+    try: requests.post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": text}, timeout=15)
+    except Exception as e: log.warning("tg reply %s: %s", chat, e)
+
+def tg_handle_update(u):
+    kinds = [k for k in u if k != "update_id"]
+    msg = u.get("message") or u.get("edited_message") or u.get("channel_post") or {}
+    chat = (msg.get("chat") or {}).get("id")
+    txt = (msg.get("text") or "").strip()
+    mcm = u.get("my_chat_member")
+    if mcm:  # user pressed Start / blocked the bot
+        chat = mcm["chat"]["id"]; status = mcm.get("new_chat_member", {}).get("status")
+        log.info("update %s my_chat_member chat=%s status=%s", u["update_id"], chat, status)
+        if status in ("kicked", "left"):
+            if chat in state["subscribers"]: state["subscribers"].remove(chat); log.info("UNSUBSCRIBED %s (blocked)", chat)
+            return
+        txt = "/start"
+    log.info("update %s kinds=%s chat=%s text=%r", u["update_id"], kinds, chat, txt[:40])
+    if not chat: return
+    if txt.lower().startswith("/stop"):
+        if chat in state["subscribers"]: state["subscribers"].remove(chat)
+        log.info("UNSUBSCRIBED %s", chat); tg_reply(chat, "Unsubscribed. Send /start to resubscribe."); return
+    if chat not in state["subscribers"]:
+        state["subscribers"].append(chat); log.info("SUBSCRIBED %s (total %d)", chat, len(state["subscribers"]))
+        tg_reply(chat, "✅ Subscribed. You'll get an alert when a GitHub-linked account claims pump.fun fees for the FIRST time. /stop to unsubscribe.")
+    elif txt.lower().startswith("/start"):
+        tg_reply(chat, "✅ Already subscribed. /stop to unsubscribe.")
+
 def tg_poll():
+    log.info("tg poll started (offset %s, %d subscribers)", state["tg_offset"], len(state["subscribers"]))
     while True:
         try:
-            r = requests.get(f"{TGAPI}/getUpdates", params={"offset": state["tg_offset"], "timeout": 50}, timeout=60).json()
-            for u in r.get("result", []):
+            r = requests.get(f"{TGAPI}/getUpdates", params={"offset": state["tg_offset"], "timeout": 25,
+                             "allowed_updates": json.dumps(["message", "edited_message", "my_chat_member", "channel_post"])}, timeout=40)
+            j = r.json()
+            if not j.get("ok"):
+                log.warning("tg getUpdates not ok: %s %s", r.status_code, j.get("description")); time.sleep(10); continue
+            for u in j.get("result", []):
+                try: tg_handle_update(u)
+                except Exception as e: log.exception("tg update %s failed: %s", u.get("update_id"), e)
                 state["tg_offset"] = u["update_id"] + 1
-                msg = u.get("message") or {}; txt = (msg.get("text") or "").strip(); chat = msg.get("chat", {}).get("id")
-                if not chat: continue
-                if txt.startswith("/start"):
-                    if chat not in state["subscribers"]: state["subscribers"].append(chat)
-                    reply = "✅ Subscribed. You'll get an alert when a GitHub-linked account claims pump.fun fees for the FIRST time. /stop to unsubscribe."
-                elif txt.startswith("/stop"):
-                    if chat in state["subscribers"]: state["subscribers"].remove(chat)
-                    reply = "Unsubscribed."
-                else: continue
-                save_state(state); log.info("chat %s: %s", chat, txt.split()[0])
-                requests.post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": reply}, timeout=15)
-            save_state(state)
+                save_state(state)
+        except requests.exceptions.ReadTimeout:
+            continue
         except Exception as e:
-            log.warning("tg poll: %s", e); time.sleep(5)
+            log.warning("tg poll: %s", str(e)[:200]); time.sleep(5)
+
+def tg_supervisor():
+    while True:
+        try: tg_poll()
+        except BaseException as e: log.exception("tg poll crashed: %s", e)
+        time.sleep(5)
 
 def handle_sig(sig, send=True):
     if sig in state["seen"]: return None
@@ -208,7 +240,7 @@ def main():
             if state["subscribers"]: tg_send_all(text); print("sent to", len(state["subscribers"]), "subscriber(s)")
             else: print("(no subscribers yet; not sent)")
         return
-    threading.Thread(target=tg_poll, daemon=True).start()
+    threading.Thread(target=tg_supervisor, daemon=True).start()
     asyncio.run(ws_loop())
 
 if __name__ == "__main__": main()
