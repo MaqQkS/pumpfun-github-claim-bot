@@ -38,7 +38,7 @@ def rpc(method, params, tries=4):
 
 def get_tx(sig):
     for _ in range(6):  # tx may not be queryable for a moment after the log
-        t = rpc("getTransaction", [sig, {"encoding": "json", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}])
+        t = rpc("getTransaction", [sig, {"encoding": "json", "maxSupportedTransactionVersion": 1, "commitment": "confirmed"}])
         if t: return t
         time.sleep(2)
     return None
@@ -80,12 +80,32 @@ def find_mint_in_tx(t, pda):
 def resolve_mint(t, sig, pda):
     m = find_mint_in_tx(t, pda)
     if m: return m
-    sigs = rpc("getSignaturesForAddress", [pda, {"limit": 6, "before": sig}]) or []
-    for s in sigs[:4]:
-        if t.get("blockTime") and s.get("blockTime") and t["blockTime"] - s["blockTime"] > 300: break
+    sigs = rpc("getSignaturesForAddress", [pda, {"limit": 10, "before": sig, "commitment": "confirmed"}]) or []
+    for s in sigs[:8]:
+        if t.get("blockTime") and s.get("blockTime") and t["blockTime"] - s["blockTime"] > 600: break
         pt = get_tx(s["signature"])
         if pt and (m := find_mint_in_tx(pt, pda)): return m
+    ms = vault_mints(pda)
+    if len(ms) == 1: return ms[0]
+    if ms: log.info("vault %s in %d sharing configs, mint ambiguous", pda[:8], len(ms))
     return None
+
+SHARING_DISC = base58.b58encode(bytes.fromhex("d84a0900388c5d4b")).decode()
+_vm = {}
+def vault_mints(pda, max_slots=10):
+    """Mints whose SharingConfig lists this vault (getProgramAccounts, 10 credits each). Cached 10 min."""
+    if pda in _vm and time.time() - _vm[pda][0] < 600: return _vm[pda][1]
+    mints = []
+    for i in range(max_slots):
+        res = rpc("getProgramAccounts", [FEE_PROG, {"encoding": "base64", "dataSlice": {"offset": 11, "length": 32},
+              "filters": [{"memcmp": {"offset": 0, "bytes": SHARING_DISC}}, {"memcmp": {"offset": 80 + 34 * i, "bytes": pda}}]}])
+        if res is None: break
+        for a in res:
+            m = base58.b58encode(base64.b64decode(a["account"]["data"][0])).decode()
+            if m not in mints: mints.append(m)
+        if not res and i >= 1 and not mints: break   # vault typically in slot 0/1; stop early when nothing found
+    _vm[pda] = (time.time(), mints)
+    return mints
 
 _gh = {}
 def github_login(uid):
@@ -124,6 +144,15 @@ def coin_info(mint):
 
 def format_alert(c, mint, sig, kind="FIRST claim ever"):
     login, name = github_login(c["user_id"])
+    if not mint:
+        cands = vault_mints(c["pda"])
+        if cands:
+            lines = []
+            for m in cands[:5]:
+                sy, mc_, at = coin_info(m)
+                lines.append(f"${sy}\n{m}\n• MC: {compact(mc_)} ATH: {compact(at)[1:] if at else 'n/a'}")
+            login, name = github_login(c["user_id"]); who = login or f"GitHub id {c['user_id']}"
+            return "\n\n".join(lines) + f"\n• 🐙 {kind} by GitHub {who}: {c['amount']/1e9:.2f} SOL (token ambiguous: vault is in {len(cands)} fee configs)\nGitHub: https://github.com/{login}\nTx: https://solscan.io/tx/{sig}"
     sym, mc, ath = coin_info(mint) if mint else ("UNKNOWN", None, None)
     who = f"{login}" + (f" ({name})" if name else "") if login else f"GitHub id {c['user_id']}"
     gh = f"https://github.com/{login}" if login else f"https://api.github.com/user/{c['user_id']}"
@@ -217,7 +246,7 @@ def vault_history(pda, before_sig):
         nonlocal budget
         sigs_all = []
         while True:
-            page = rpc("getSignaturesForAddress", [pda, dict(limit=1000, **params)]) or []
+            page = rpc("getSignaturesForAddress", [pda, dict(limit=1000, commitment="confirmed", **params)]) or []
             sigs_all += page
             if len(page) < 1000: return sigs_all, True
             params = {**params, "before": page[-1]["signature"]}
