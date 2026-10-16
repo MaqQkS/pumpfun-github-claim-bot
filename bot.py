@@ -365,6 +365,17 @@ def enrich(t, c, mint, record=True):
     if c["lifetime"] >= 1000e9 and c["amount"] != c["lifetime"]: tags.append(f"⚠️ vault lifetime {c['lifetime']/1e9:,.0f} SOL across tokens")
     c["tags"] = tags
 
+def muted_set():
+    """GitHub ids/logins to mute: env MUTED_GITHUB (comma list) + state['muted_github']. Default: UsePaid (id 322216527)."""
+    raw = os.environ.get("MUTED_GITHUB", "322216527,UsePaid") + "," + ",".join(state.get("muted_github", []))
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+def is_muted(uid):
+    m = muted_set()
+    if str(uid).lower() in m: return True
+    login = github_login(uid)[0]
+    return bool(login) and login.lower() in m
+
 def handle_sig(sig, send=True, prefix=""):
     if send and sig in state["seen"]: return None
     t = get_tx(sig)
@@ -378,6 +389,8 @@ def handle_sig(sig, send=True, prefix=""):
         if send:
             uc = state.setdefault("user_claims", {}); uc[c["user_id"]] = ([x for x in uc.get(c["user_id"], []) if time.time() - x < 86400] + [time.time()])[-200:]
         if not kind: continue
+        if is_muted(c["user_id"]):
+            log.info("MUTED claim %s user=%s mint=%s (%s)", sig[:12], c["user_id"], mint, kind); continue
         enrich(t, c, mint, record=False)
         text = prefix + format_alert(c, mint, sig, kind); msgs.append(text); log.info("ALERT\n%s", text)
         if send: tg_send_all(text)
