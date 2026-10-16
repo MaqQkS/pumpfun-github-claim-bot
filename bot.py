@@ -129,13 +129,27 @@ def vault_mints(pda, max_slots=10):
     return mints
 
 _gh = {}
-def github_login(uid):
+def github_info(uid):
     if uid in _gh: return _gh[uid]
     try:
         r = requests.get(f"https://api.github.com/user/{uid}", timeout=10, headers={"Accept": "application/vnd.github+json"})
-        if r.ok: _gh[uid] = (r.json()["login"], r.json().get("name")); return _gh[uid]
+        if r.ok:
+            j = r.json(); _gh[uid] = {k: j.get(k) for k in ("login", "name", "created_at", "followers", "public_repos", "type")}
+            return _gh[uid]
     except Exception as e: log.warning("github lookup failed: %s", e)
-    return (None, None)
+    return {}
+
+def github_login(uid):
+    g = github_info(uid); return (g.get("login"), g.get("name"))
+
+def github_stats(uid):
+    g = github_info(uid)
+    if not g.get("created_at"): return "GitHub stats n/a"
+    import datetime as _d
+    age = (_d.datetime.now(_d.timezone.utc) - _d.datetime.fromisoformat(g["created_at"].replace("Z", "+00:00"))).days
+    age_s = f"{age/365:.1f}y" if age >= 365 else f"{age}d"
+    flag = " ⚠️ new/empty account" if age < 180 or (g.get("public_repos") or 0) == 0 else ""
+    return f"👤 {g.get('followers')} followers · {g.get('public_repos')} repos · acct age {age_s}{flag}"
 
 def compact(v):
     if v is None: return "n/a"
@@ -145,12 +159,13 @@ def compact(v):
             return f"${s}{suf}"
     return f"${v:.0f}"
 
+_creator = {}
 def coin_info(mint):
     sym = mc = ath = None
     try:
         r = requests.get(f"https://frontend-api-v3.pump.fun/coins-v2/{mint}", timeout=10)
         if r.ok:
-            d = r.json(); sym = d.get("symbol"); mc = d.get("usd_market_cap") or d.get("market_cap_usd"); ath = d.get("ath_market_cap")
+            d = r.json(); _creator[mint] = d.get("creator"); sym = d.get("symbol"); mc = d.get("usd_market_cap") or d.get("market_cap_usd"); ath = d.get("ath_market_cap")
     except Exception as e: log.warning("pump api: %s", e)
     if not sym or mc is None:
         try:
@@ -180,7 +195,11 @@ def format_alert(c, mint, sig, kind="FIRST claim ever"):
             blocks = [_hdr(*(lambda r: (r[0], m, r[1], r[2]))(coin_info(m))) for m in cands[:5]]
             return "\n\n".join(blocks) + f"\n• 🐙 {E(kind)} by GitHub {E(who)}: {amt} (token ambiguous: vault is in {len(cands)} fee configs)\nGitHub: {E(gh)}\nTx: https://solscan.io/tx/{E(sig)}"
     sym, mc, ath = coin_info(mint) if mint else ("UNKNOWN", None, None)
-    lines = [_hdr(sym, mint, mc, ath), f"• 🐙 {E(kind)} by GitHub {E(who)}: {amt}",
+    tags = list(c.get("tags", []))
+    rec = c["recipient"]
+    if mint and _creator.get(mint) == rec: tags.append("🔁 self-funded: recipient = token deployer")
+    elif c.get("sc_admin") == rec: tags.append("🔁 self-funded: recipient = fee-share admin")
+    lines = [_hdr(sym, mint, mc, ath), f"• 🐙 {E(kind)} by GitHub {E(who)}: {amt}", E(github_stats(c["user_id"]))] + [E(x) for x in tags] + [
              (f"pump.fun: https://pump.fun/coin/{E(mint)}\n" if mint else "") + f"GitHub: {E(gh)}\nTx: https://solscan.io/tx/{E(sig)}"]
     return "\n".join(lines)
 
@@ -325,6 +344,27 @@ def evaluate(sig, t, c):
     if claimed_mint_before(vh, mint): return None, mint, key
     return ("FIRST claim on this token" if vh["complete"] else "FIRST claim on this token (unverified)"), mint, key
 
+AUTHORITY = "2sMrGNK8i36YRkF5WWCwnaUYuwDJhHe1g2xA8aPvhkjM"
+def enrich(t, c, mint, record=True):
+    keys = tx_keys(t); ns = t["transaction"]["message"]["header"]["numRequiredSignatures"]; signers = keys[:ns]
+    tags = []
+    if signers[0] == AUTHORITY: tags.append("✅ claimed via pump.fun app (pump.fun paid gas, owner login)")
+    elif c["recipient"] in signers: tags.append("🤖 recipient wallet signed (pump.fun API/app; can be automated)")
+    sc = None
+    for ix in all_ix(t):
+        if keys[ix["programIdIndex"]] == PUMP_PROG and base58.b58decode(ix["data"])[:8] == DISTRIBUTE and c["pda"] in [keys[a] for a in ix["accounts"]]:
+            sc = keys[ix["accounts"][2]]
+    if sc:
+        r = rpc("getAccountInfo", [sc, {"encoding": "base64", "dataSlice": {"offset": 43, "length": 32}}])
+        if r and r.get("value"): c["sc_admin"] = base58.b58encode(base64.b64decode(r["value"]["data"][0])).decode()
+    elif mint: tags.append("❔ token inferred from earlier distribution (claim tx itself has no mint)")
+    now = time.time(); uc = state.setdefault("user_claims", {})
+    hist = [x for x in uc.get(c["user_id"], []) if now - x < 86400]
+    if record: hist.append(now); uc[c["user_id"]] = hist[-200:]
+    if len(hist) >= 5: tags.append(f"⚠️ high-frequency claimer: {len(hist)} claims/24h (likely platform/aggregator)")
+    if c["lifetime"] >= 1000e9 and c["amount"] != c["lifetime"]: tags.append(f"⚠️ vault lifetime {c['lifetime']/1e9:,.0f} SOL across tokens")
+    c["tags"] = tags
+
 def handle_sig(sig, send=True, prefix=""):
     if send and sig in state["seen"]: return None
     t = get_tx(sig)
@@ -335,7 +375,10 @@ def handle_sig(sig, send=True, prefix=""):
         kind, mint, key = evaluate(sig, t, c)
         log.info("claim %s user=%s mint=%s amt=%.3f lifetime=%.3f -> %s", sig[:12], c["user_id"], mint, c["amount"]/1e9, c["lifetime"]/1e9, kind)
         if send and mint and key not in state["pairs"]: state["pairs"].append(key)
+        if send:
+            uc = state.setdefault("user_claims", {}); uc[c["user_id"]] = ([x for x in uc.get(c["user_id"], []) if time.time() - x < 86400] + [time.time()])[-200:]
         if not kind: continue
+        enrich(t, c, mint, record=False)
         text = prefix + format_alert(c, mint, sig, kind); msgs.append(text); log.info("ALERT\n%s", text)
         if send: tg_send_all(text)
     if send:
