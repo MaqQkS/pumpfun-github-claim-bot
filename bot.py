@@ -148,8 +148,8 @@ def github_stats(uid):
     import datetime as _d
     age = (_d.datetime.now(_d.timezone.utc) - _d.datetime.fromisoformat(g["created_at"].replace("Z", "+00:00"))).days
     age_s = f"{age/365:.1f}y" if age >= 365 else f"{age}d"
-    flag = " ⚠️ new/empty account" if age < 180 or (g.get("public_repos") or 0) == 0 else ""
-    return f"👤 {g.get('followers')} followers · {g.get('public_repos')} repos · acct age {age_s}{flag}"
+    flag = " · new/empty acct" if age < 180 or (g.get("public_repos") or 0) == 0 else ""
+    return f"{g.get('followers')} followers · {g.get('public_repos')} repos · {age_s} old{flag}"
 
 def compact(v):
     if v is None: return "n/a"
@@ -179,32 +179,58 @@ def coin_info(mint):
     return sym or "UNKNOWN", mc, ath
 
 E = html.escape
-def _hdr(sym, mint, mc, ath):
+MIN_FIRST_CLAIM_SOL = float(os.environ.get("MIN_FIRST_CLAIM_SOL", "0.3"))
+
+def _label(kind):
+    k = (kind or "").lower()
+    if "first" in k: return "🆕 FIRST CLAIM" + (" (ever)" if "ever" in k else "")
+    if "repeat" in k: return "🔁 REPEAT CLAIM"
+    return "🐙 " + (kind or "CLAIM").upper()
+
+def _token_block(sym, mint, mc, ath):
     ca = f"<code>{E(mint)}</code>" if mint else "(mint not resolved)"
-    return f"${E(str(sym))}\n{ca}\n• MC: {E(compact(mc))} ATH: {E(compact(ath)[1:]) if ath else 'n/a'}"
+    athv = E(compact(ath)) if ath else "n/a"
+    return f"${E(str(sym))}\n{ca}\n\n🧠 Token\n• MC: {E(compact(mc))} | ATH: {athv}"
+
+def _hdr(sym, mint, mc, ath):  # kept for compatibility
+    return _token_block(sym, mint, mc, ath)
+
+def _links(mint, gh, sig):
+    parts = []
+    if mint: parts.append(f'<a href="https://pump.fun/coin/{E(mint)}">pump.fun</a>')
+    parts.append(f'<a href="{E(gh)}">GitHub</a>')
+    parts.append(f'<a href="https://solscan.io/tx/{E(sig)}">Tx</a>')
+    return "🔗 " + " · ".join(parts)
 
 def format_alert(c, mint, sig, kind="FIRST claim ever"):
     """Returns Telegram HTML."""
     login, name = github_login(c["user_id"])
-    who = (login + (f" ({name})" if name else "")) if login else f"GitHub id {c['user_id']}"
+    who = (login + (f" ({name})" if name else "")) if login else f"id {c['user_id']}"
     gh = f"https://github.com/{login}" if login else f"https://api.github.com/user/{c['user_id']}"
     amt = f"{c['amount']/1e9:.2f} SOL"
+    flags = []
+    if "unverified" in (kind or ""): flags.append("unverified")
+    flags += list(c.get("tags", []))
+    rec = c["recipient"]
     if not mint:
         cands = vault_mints(c["pda"])
         if cands:
-            blocks = [_hdr(*(lambda r: (r[0], m, r[1], r[2]))(coin_info(m))) for m in cands[:5]]
-            return "\n\n".join(blocks) + f"\n• 🐙 {E(kind)} by GitHub {E(who)}: {amt} (token ambiguous: vault is in {len(cands)} fee configs)\nGitHub: {E(gh)}\nTx: https://solscan.io/tx/{E(sig)}"
+            blocks = [_token_block(*(lambda r: (r[0], m, r[1], r[2]))(coin_info(m))) for m in cands[:5]]
+            flags.append(f"token ambiguous ({len(cands)} fee configs)")
+            out = [f"{_label(kind)}", "\n\n".join(blocks), "", f"💸 Claim: {amt} by {E(who)}", f"👤 Dev: {E(github_stats(c['user_id']))}",
+                   "⚠️ " + " · ".join(E(x) for x in flags), "", _links(None, gh, sig)]
+            return "\n".join(out)
     sym, mc, ath = coin_info(mint) if mint else ("UNKNOWN", None, None)
-    tags = list(c.get("tags", []))
-    rec = c["recipient"]
-    if mint and _creator.get(mint) == rec: tags.append("🔁 self-funded: recipient = token deployer")
-    elif c.get("sc_admin") == rec: tags.append("🔁 self-funded: recipient = fee-share admin")
-    lines = [_hdr(sym, mint, mc, ath), f"• 🐙 {E(kind)} by GitHub {E(who)}: {amt}", E(github_stats(c["user_id"]))] + [E(x) for x in tags] + [
-             (f"pump.fun: https://pump.fun/coin/{E(mint)}\n" if mint else "") + f"GitHub: {E(gh)}\nTx: https://solscan.io/tx/{E(sig)}"]
-    return "\n".join(lines)
+    if mint and _creator.get(mint) == rec: flags.append("self-funded (deployer)")
+    elif c.get("sc_admin") == rec: flags.append("self-funded (fee admin)")
+    tb = _token_block(sym, mint, mc, ath).split("\n", 1)
+    out = [f"{_label(kind)} · {tb[0]}", tb[1], "", f"💸 Claim: {amt} by {E(who)}", f"👤 Dev: {E(github_stats(c['user_id']))}"]
+    if flags: out.append("⚠️ " + " · ".join(E(x) for x in flags))
+    out += ["", _links(mint, gh, sig)]
+    return "\n".join(out)
 
 def html_to_plain(t):
-    return html.unescape(re.sub(r"</?code>", "", t))
+    return html.unescape(re.sub(r"<a href=\"([^\"]*)\">([^<]*)</a>", r"\2: \1", re.sub(r"</?code>", "", t)))
 
 def tg_send_all(text):
     for chat in list(state["subscribers"]):
@@ -348,8 +374,8 @@ AUTHORITY = "2sMrGNK8i36YRkF5WWCwnaUYuwDJhHe1g2xA8aPvhkjM"
 def enrich(t, c, mint, record=True):
     keys = tx_keys(t); ns = t["transaction"]["message"]["header"]["numRequiredSignatures"]; signers = keys[:ns]
     tags = []
-    if signers[0] == AUTHORITY: tags.append("✅ claimed via pump.fun app (pump.fun paid gas, owner login)")
-    elif c["recipient"] in signers: tags.append("🤖 recipient wallet signed (pump.fun API/app; can be automated)")
+    if signers[0] == AUTHORITY: tags.append("app claim")
+    elif c["recipient"] in signers: tags.append("automated signer")
     sc = None
     for ix in all_ix(t):
         if keys[ix["programIdIndex"]] == PUMP_PROG and base58.b58decode(ix["data"])[:8] == DISTRIBUTE and c["pda"] in [keys[a] for a in ix["accounts"]]:
@@ -357,12 +383,12 @@ def enrich(t, c, mint, record=True):
     if sc:
         r = rpc("getAccountInfo", [sc, {"encoding": "base64", "dataSlice": {"offset": 43, "length": 32}}])
         if r and r.get("value"): c["sc_admin"] = base58.b58encode(base64.b64decode(r["value"]["data"][0])).decode()
-    elif mint: tags.append("❔ token inferred from earlier distribution (claim tx itself has no mint)")
+    elif mint: tags.append("token inferred")
     now = time.time(); uc = state.setdefault("user_claims", {})
     hist = [x for x in uc.get(c["user_id"], []) if now - x < 86400]
     if record: hist.append(now); uc[c["user_id"]] = hist[-200:]
-    if len(hist) >= 5: tags.append(f"⚠️ high-frequency claimer: {len(hist)} claims/24h (likely platform/aggregator)")
-    if c["lifetime"] >= 1000e9 and c["amount"] != c["lifetime"]: tags.append(f"⚠️ vault lifetime {c['lifetime']/1e9:,.0f} SOL across tokens")
+    if len(hist) >= 5: tags.append(f"{len(hist)} claims/24h")
+    if c["lifetime"] >= 1000e9 and c["amount"] != c["lifetime"]: tags.append(f"vault lifetime {c['lifetime']/1e9:,.0f} SOL")
     c["tags"] = tags
 
 def muted_set():
@@ -389,6 +415,8 @@ def handle_sig(sig, send=True, prefix=""):
         if send:
             uc = state.setdefault("user_claims", {}); uc[c["user_id"]] = ([x for x in uc.get(c["user_id"], []) if time.time() - x < 86400] + [time.time()])[-200:]
         if not kind: continue
+        if "first" in kind.lower() and c["amount"] / 1e9 < MIN_FIRST_CLAIM_SOL:
+            log.info("BELOW MIN claim %s user=%s mint=%s amt=%.3f < %.2f (%s)", sig[:12], c["user_id"], mint, c["amount"]/1e9, MIN_FIRST_CLAIM_SOL, kind); continue
         if is_muted(c["user_id"]):
             log.info("MUTED claim %s user=%s mint=%s (%s)", sig[:12], c["user_id"], mint, kind); continue
         enrich(t, c, mint, record=False)
