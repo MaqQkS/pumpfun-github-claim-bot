@@ -195,9 +195,13 @@ def _token_block(sym, mint, mc, ath):
 def _hdr(sym, mint, mc, ath):  # kept for compatibility
     return _token_block(sym, mint, mc, ath)
 
+AXIOM_REF = os.environ.get("AXIOM_REF", "maq")
+PUMP_REF = os.environ.get("PUMP_REF", "RoqFIG")
+
 def _links(mint, gh, sig):
     parts = []
-    if mint: parts.append(f'<a href="https://pump.fun/coin/{E(mint)}">pump.fun</a>')
+    if mint: parts.append(f'<a href="https://axiom.trade/t/{E(mint)}/@{E(AXIOM_REF)}?chain=sol">Axiom</a>')
+    if mint: parts.append(f'<a href="https://pump.fun/coin/{E(mint)}?ref={E(PUMP_REF)}">pump.fun</a>')
     parts.append(f'<a href="{E(gh)}">GitHub</a>')
     parts.append(f'<a href="https://solscan.io/tx/{E(sig)}">Tx</a>')
     return "🔗 " + " · ".join(parts)
