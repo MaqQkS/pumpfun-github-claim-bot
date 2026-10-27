@@ -211,7 +211,12 @@ def format_alert(c, mint, sig, kind="FIRST claim ever"):
     login, name = github_login(c["user_id"])
     who = (login + (f" ({name})" if name else "")) if login else f"id {c['user_id']}"
     gh = f"https://github.com/{login}" if login else f"https://api.github.com/user/{c['user_id']}"
-    amt = f"{c['amount']/1e9:.2f} SOL"
+    share = c.get("share")
+    amt = f"{(share if share is not None else c['amount'])/1e9:.2f} SOL"
+    sweep = ""
+    if share is not None and c["amount"] - share > 5_000_000:
+        n = c.get("ncoins", 1)
+        sweep = f"\n   ↳ part of a {c['amount']/1e9:.2f} SOL claim across {n} coin{'s' if n != 1 else ''}"
     flags = []
     if "unverified" in (kind or ""): flags.append("unverified")
     flags += list(c.get("tags", []))
@@ -221,14 +226,14 @@ def format_alert(c, mint, sig, kind="FIRST claim ever"):
         if cands:
             blocks = [_token_block(*(lambda r: (r[0], m, r[1], r[2]))(coin_info(m))) for m in cands[:5]]
             flags.append(f"token ambiguous ({len(cands)} fee configs)")
-            out = [f"{_label(kind)}", "\n\n".join(blocks), "", f"💸 Claim: {amt} by {E(who)}", f"👤 Dev: {E(github_stats(c['user_id']))}",
+            out = [f"{_label(kind)}", "\n\n".join(blocks), "", f"💸 Claim: {amt} by {E(who)}{E(sweep)}", f"👤 Dev: {E(github_stats(c['user_id']))}",
                    "⚠️ " + " · ".join(E(x) for x in flags), "", _links(None, gh, sig)]
             return "\n".join(out)
     sym, mc, ath = coin_info(mint) if mint else ("UNKNOWN", None, None)
     if mint and _creator.get(mint) == rec: flags.append("self-funded (deployer)")
     elif c.get("sc_admin") == rec: flags.append("self-funded (fee admin)")
     tb = _token_block(sym, mint, mc, ath).split("\n", 1)
-    out = [f"{_label(kind)} · {tb[0]}", tb[1], "", f"💸 Claim: {amt} by {E(who)}", f"👤 Dev: {E(github_stats(c['user_id']))}"]
+    out = [f"{_label(kind)} · {tb[0]}", tb[1], "", f"💸 Claim: {amt} by {E(who)}{E(sweep)}", f"👤 Dev: {E(github_stats(c['user_id']))}"]
     if flags: out.append("⚠️ " + " · ".join(E(x) for x in flags))
     out += ["", _links(mint, gh, sig)]
     return "\n".join(out)
@@ -304,6 +309,23 @@ def tg_supervisor():
 LINK_WINDOW = 300          # distribute counts as "claimed from mint" if within 5 min before a claim
 HIST_MAX_TX = int(os.environ.get("HIST_MAX_TX", "150"))   # cap getTransaction calls per history scan
 
+SYS_PROG = "11111111111111111111111111111111"
+def dist_amounts(t, pda):
+    """{mint: lamports} moved into this vault by pump.fun distribute ixs in one tx (from the inner system transfers)."""
+    keys = tx_keys(t); m = t["transaction"]["message"]; res = {}
+    groups = {g["index"]: g["instructions"] for g in (t["meta"].get("innerInstructions") or [])}
+    for i, ix in enumerate(m["instructions"]):
+        cur = curh = None
+        for j, x in enumerate([ix] + groups.get(i, [])):
+            h = 1 if j == 0 else (x.get("stackHeight") or 2)
+            if cur and h <= curh: cur = None
+            p = keys[x["programIdIndex"]]; raw = base58.b58decode(x["data"]); accts = [keys[a] for a in x["accounts"]]
+            if p == PUMP_PROG and raw[:8] == DISTRIBUTE and pda in accts:
+                cur, curh = accts[0], h; res.setdefault(cur, 0)
+            elif cur and p == SYS_PROG and raw[:4] == b"\x02\x00\x00\x00" and len(accts) > 1 and accts[1] == pda:
+                res[cur] += struct.unpack_from("<Q", raw, 4)[0]
+    return res
+
 def tx_events(t, pda):
     """(distributed mints for this vault, is_claim) for one tx."""
     keys = tx_keys(t); mints = []; claim = False
@@ -318,6 +340,7 @@ def tx_events(t, pda):
 
 def vault_history(pda, before_sig):
     """Scan the vault's txs older than before_sig (cached per vault). Returns cache dict."""
+    if state.get("vault_hist_v") != 2: state["vault_hist"] = {}; state["vault_hist_v"] = 2
     vh = state.setdefault("vault_hist", {}).setdefault(pda, {"newest": None, "oldest": None, "complete": False, "dists": [], "claims": []})
     budget = HIST_MAX_TX
     def scan(params):
@@ -338,7 +361,8 @@ def vault_history(pda, before_sig):
             t = get_tx(s["signature"]); budget -= 1; done += 1
             if not t: continue
             mints, claim = tx_events(t, pda); bt = t.get("blockTime") or 0
-            for m in mints: vh["dists"].append([m, bt])
+            amts = dist_amounts(t, pda)
+            for m in dict.fromkeys(mints): vh["dists"].append([m, bt, amts.get(m, 0)])
             if claim: vh["claims"].append(bt)
         return done
     # newer-than-cache part (between cached newest and the current tx)
@@ -358,21 +382,36 @@ def vault_history(pda, before_sig):
     return vh
 
 def claimed_mint_before(vh, mint):
-    for m, bt in vh["dists"]:
+    for m, bt, *_ in vh["dists"]:
         if m == mint and any(0 <= c - bt <= LINK_WINDOW for c in vh["claims"]): return True
     return False
 
 def evaluate(sig, t, c):
-    """Return (kind, mint) for an alert, or (None, mint)."""
-    mint = resolve_mint(t, sig, c["pda"])
+    """A claim sweeps the whole vault, which can hold fees from many coins. Returns
+    [(kind, mint, key, share_lamports_or_None)] with each coin's share of this claim."""
     pairs = state.setdefault("pairs", [])
-    key = f'{c["user_id"]}:{mint}'
-    if c["amount"] == c["lifetime"] and c["amount"] > 0: return "FIRST claim ever", mint, key
-    if not mint: return None, mint, key
-    if key in pairs: return None, mint, key
+    first_ever = c["amount"] == c["lifetime"] and c["amount"] > 0
+    bt = t.get("blockTime") or 0
+    shares = dict(dist_amounts(t, c["pda"]))
     vh = vault_history(c["pda"], sig)
-    if claimed_mint_before(vh, mint): return None, mint, key
-    return ("FIRST claim on this token" if vh["complete"] else "FIRST claim on this token (unverified)"), mint, key
+    prev = max([x for x in vh["claims"] if x < bt] or [0])
+    for d in vh["dists"]:
+        if len(d) >= 3 and prev < d[1] <= bt: shares[d[0]] = shares.get(d[0], 0) + d[2]
+    shares = {m: v for m, v in shares.items() if v > 0}
+    if not shares:   # couldn't see where the money came from: old single-coin guess, amount = whole claim
+        mint = resolve_mint(t, sig, c["pda"]); key = f'{c["user_id"]}:{mint}'
+        if first_ever: return [("FIRST claim ever", mint, key, None)]
+        if not mint or key in pairs or claimed_mint_before(vh, mint): return [(None, mint, key, None)]
+        return [("FIRST claim on this token" if vh["complete"] else "FIRST claim on this token (unverified)", mint, key, None)]
+    out = []
+    for mint, lam in sorted(shares.items(), key=lambda kv: -kv[1]):
+        key = f'{c["user_id"]}:{mint}'
+        if key in pairs: kind = None
+        elif first_ever: kind = "FIRST claim ever"
+        elif claimed_mint_before(vh, mint): kind = None
+        else: kind = "FIRST claim on this token" if vh["complete"] else "FIRST claim on this token (unverified)"
+        out.append((kind, mint, key, lam))
+    return out
 
 AUTHORITY = "2sMrGNK8i36YRkF5WWCwnaUYuwDJhHe1g2xA8aPvhkjM"
 def enrich(t, c, mint, record=True):
@@ -387,7 +426,7 @@ def enrich(t, c, mint, record=True):
     if sc:
         r = rpc("getAccountInfo", [sc, {"encoding": "base64", "dataSlice": {"offset": 43, "length": 32}}])
         if r and r.get("value"): c["sc_admin"] = base58.b58encode(base64.b64decode(r["value"]["data"][0])).decode()
-    elif mint: tags.append("token inferred")
+    elif mint and c.get("share") is None: tags.append("token inferred")
     now = time.time(); uc = state.setdefault("user_claims", {})
     hist = [x for x in uc.get(c["user_id"], []) if now - x < 86400]
     if record: hist.append(now); uc[c["user_id"]] = hist[-200:]
@@ -413,19 +452,35 @@ def handle_sig(sig, send=True, prefix=""):
     msgs = []
     for c in decode_claims(t):
         if c["platform"] != 2: continue
-        kind, mint, key = evaluate(sig, t, c)
-        log.info("claim %s user=%s mint=%s amt=%.3f lifetime=%.3f -> %s", sig[:12], c["user_id"], mint, c["amount"]/1e9, c["lifetime"]/1e9, kind)
-        if send and mint and key not in state["pairs"]: state["pairs"].append(key)
+        res = evaluate(sig, t, c)
         if send:
             uc = state.setdefault("user_claims", {}); uc[c["user_id"]] = ([x for x in uc.get(c["user_id"], []) if time.time() - x < 86400] + [time.time()])[-200:]
-        if not kind: continue
-        if "first" in kind.lower() and c["amount"] / 1e9 < MIN_FIRST_CLAIM_SOL:
-            log.info("BELOW MIN claim %s user=%s mint=%s amt=%.3f < %.2f (%s)", sig[:12], c["user_id"], mint, c["amount"]/1e9, MIN_FIRST_CLAIM_SOL, kind); continue
-        if is_muted(c["user_id"]):
-            log.info("MUTED claim %s user=%s mint=%s (%s)", sig[:12], c["user_id"], mint, kind); continue
-        enrich(t, c, mint, record=False)
-        text = prefix + format_alert(c, mint, sig, kind); msgs.append(text); log.info("ALERT\n%s", text)
-        if send: tg_send_all(text)
+        hits = []
+        for kind, mint, key, lam in res:
+            share = (lam if lam is not None else c["amount"]) / 1e9
+            log.info("claim %s user=%s mint=%s share=%.3f amt=%.3f lifetime=%.3f coins=%d -> %s", sig[:12], c["user_id"], mint, share, c["amount"]/1e9, c["lifetime"]/1e9, len(res), kind)
+            if send and mint and key not in state["pairs"]: state["pairs"].append(key)
+            if not kind: continue
+            if "first" in kind.lower() and share < MIN_FIRST_CLAIM_SOL:
+                log.info("BELOW MIN claim %s user=%s mint=%s share=%.3f < %.2f (%s)", sig[:12], c["user_id"], mint, share, MIN_FIRST_CLAIM_SOL, kind); continue
+            if is_muted(c["user_id"]):
+                log.info("MUTED claim %s user=%s mint=%s (%s)", sig[:12], c["user_id"], mint, kind); continue
+            hits.append((kind, mint, lam))
+        if hits:   # one message per claim: biggest coin up top, any other qualifying coins listed under it
+            kind, mint, lam = hits[0]
+            cc = dict(c, share=lam, ncoins=len(res))
+            enrich(t, cc, mint, record=False)
+            if len(res) >= 5: cc["tags"].append(f"{len(res)} coins in one claim")
+            text = format_alert(cc, mint, sig, kind)
+            if len(hits) > 1:
+                extra = []
+                for k2, m2, l2 in hits[1:8]:
+                    sym2 = coin_info(m2)[0]
+                    extra.append(f'• ${E(str(sym2))} {l2/1e9:.2f} SOL · <a href="https://axiom.trade/t/{E(m2)}/@{E(AXIOM_REF)}?chain=sol">Axiom</a> · <code>{E(m2)}</code>')
+                if len(hits) > 8: extra.append(f"• +{len(hits)-8} more")
+                text = text.replace("\n\n🔗 ", "\n\n➕ Also first claims:\n" + "\n".join(extra) + "\n\n🔗 ", 1)
+            text = prefix + text; msgs.append(text); log.info("ALERT\n%s", text)
+            if send: tg_send_all(text)
     if send:
         state["seen"] = (state["seen"] + [sig])[-2000:]
     save_state(state)
