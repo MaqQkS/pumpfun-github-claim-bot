@@ -419,6 +419,7 @@ def enrich(t, c, mint, record=True):
     tags = []
     if signers[0] == AUTHORITY: tags.append("app claim")
     elif c["recipient"] in signers: tags.append("automated signer")
+    else: tags.append("⚠️ third-party trigger")
     sc = None
     for ix in all_ix(t):
         if keys[ix["programIdIndex"]] == PUMP_PROG and base58.b58decode(ix["data"])[:8] == DISTRIBUTE and c["pda"] in [keys[a] for a in ix["accounts"]]:
