@@ -16,6 +16,7 @@ import queue
 import re
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -211,12 +212,20 @@ class _Job:
     facts: object = None
     enqueued: float = field(default_factory=time.time)
     origin: str | None = None        # reply-to-alert: "stored" | "parsed"; None for /re <CA>
+    auto: bool = False               # Phase 6 automatic research job
+    stale_at: float | None = None
 
 
 class CommandService:
     def __init__(self, cfg: CmdConfig, send, ctx: BotContext | None = None, *, adapter_factory=None, http=None,
-                 rpc_url: str | None = None):
+                 rpc_url: str | None = None, send_reply=None, auto_max_queue: int = 2, durable_helius: bool = False):
         self.cfg, self.send, self.ctx = cfg, send, ctx or BotContext()
+        self.send_reply = send_reply                     # (chat, text, reply_to_message_id) -> bool; auto reports
+        self._auto_q: deque = deque()                    # Phase 6: auto jobs wait here; manual _q always first
+        self.auto_max_queue = auto_max_queue
+        self.auto_calls = 0
+        if durable_helius:                               # direct Helius reads on Queen's key -> durable ledger
+            dd.HELIUS_SINK[0] = self._record_helius
         self._reply_ctx = None
         self._adapter_factory = adapter_factory or _default_adapter
         self._adapter = None
@@ -231,6 +240,22 @@ class CommandService:
         self._running: _Job | None = None
         self._worker = None
         self.llm_calls = 0                               # research jobs handed to the adapter (tests assert on it)
+
+    def _record_helius(self, method, credits):
+        led = getattr(self.adapter(), "ledger", None)
+        if led is not None:
+            led.record_direct_helius(method, credits)
+
+    def _helius_ok(self, need: int) -> str | None:
+        """None when allowed, else the reason. Only enforced when the durable ledger is in use."""
+        if dd.HELIUS_SINK[0] is None:
+            return None
+        try:
+            a = self.adapter()
+            dec = a.ledger.helius_allowed(a.s, need)
+            return None if dec.ok else dec.reason
+        except Exception:
+            return None
 
     # access ---------------------------------------------------------------
     def allowed(self, chat_id, user_id) -> bool:
@@ -368,15 +393,67 @@ class CommandService:
         with self._lock:
             return {"running": self._running is not None, "waiting": self._q.qsize(), "max": self.cfg.max_queue}
 
+    def _next_job(self, idle_s: float = 60.0):
+        """Manual jobs always first; an auto job runs only when no manual job is waiting."""
+        end = time.time() + idle_s
+        while True:
+            try:
+                return self._q.get_nowait()
+            except queue.Empty:
+                pass
+            with self._lock:
+                while self._auto_q:
+                    job = self._auto_q.popleft()
+                    if job.stale_at and time.time() > job.stale_at:
+                        self._finish_auto(job, "expired", "stale before a slot was free")
+                        continue
+                    return job
+            try:
+                return self._q.get(timeout=0.2)
+            except queue.Empty:
+                if time.time() > end:
+                    raise
+
+    def enqueue_auto(self, job) -> tuple[bool, str]:
+        """Bounded auto queue. Never blocks; never displaces manual work."""
+        with self._lock:
+            if len(self._auto_q) >= self.auto_max_queue:
+                return False, f"auto queue full ({self.auto_max_queue})"
+            self._auto_q.append(job)
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(target=self._research_loop, name="research-worker", daemon=True)
+                self._worker.start()
+        return True, "queued"
+
+    def _finish_auto(self, job, status, detail=""):
+        cb = getattr(job, "on_done", None)
+        if cb:
+            try:
+                cb(status, detail)
+            except Exception as e:
+                log.warning("auto job callback failed: %s", type(e).__name__)
+
     def _research_loop(self):
         while True:
             try:
-                job = self._q.get(timeout=60)
+                job = self._next_job()
             except queue.Empty:
                 with self._lock:
-                    if self._q.empty():
+                    if self._q.empty() and not self._auto_q:
                         self._worker = None
                         return
+                continue
+            if getattr(job, "auto", False):
+                with self._lock:
+                    self._running = job
+                try:
+                    self._run_auto(job)
+                except Exception as e:
+                    log.exception("auto research job failed: %s", e)
+                    self._finish_auto(job, "failed", type(e).__name__)
+                finally:
+                    with self._lock:
+                        self._running = None
                 continue
             with self._lock:
                 self._running = job
@@ -394,6 +471,32 @@ class CommandService:
                 with self._lock:
                     self._running = None
                     self._inflight.discard(job.key)
+
+    def _run_auto(self, job):
+        """Auto research: same adapter/formatter as /re, source='auto' budget, reply to the original alert."""
+        import project_context as pc
+        job.mark("running")
+        pctx = None
+        try:
+            pctx = pc.gather(job.mint, getattr(job.facts, "github_login", None), http=self.http, rpc_url=self.rpc_url)
+        except Exception:
+            pass
+        self.auto_calls += 1
+        res = self.adapter().research(f"re {job.mint}", job.facts, pc.context_block(pctx) if pctx else None,
+                                      source="auto", auto=job.limits)
+        if not res.ok:
+            self._finish_auto(job, "skipped" if res.error in ("budget", "deep_disabled") else "failed",
+                              f"{res.error}: {res.text[:120]}")
+            return
+        text = format_auto_research(job.mint, res, job.facts, pctx, job.alert_msg_id)
+        sent = False
+        try:
+            sent = bool(self.send_reply(job.chat, text, job.alert_msg_id)) if self.send_reply else False
+        except Exception as e:
+            log.warning("auto report send failed: %s", type(e).__name__)
+        cost = (res.usage or {}).get("actual_usd")
+        self._finish_auto(job, "completed" if sent else "undelivered",
+                          f"cost={cost} cached={res.cached} ms={res.latency_ms}")
 
     def adapter(self):
         if self._adapter is None:
@@ -441,6 +544,9 @@ class CommandService:
         mint, err = self._mint_arg(args)
         if err:
             return err
+        why = self._helius_ok(4)
+        if why:
+            return f"💸 Holder lookups paused: research Helius budget reached ({E(why)}). Alerts are unaffected."
         lq = dd.liquidity(mint, http=self.http)
         d = dd.holders(mint, http=self.http, rpc_url=self.rpc_url, pool_hint=lq.get("pair") if lq.get("ok") else None)
         return format_holders(mint, d, lq)
@@ -693,3 +799,19 @@ def scrub_ai_text(text: str) -> str:
     for rx, rep in _SCRUB:
         text = rx.sub(rep, text)
     return text
+
+
+# ---- Phase 6: automatic research report -------------------------------------------------------
+AUTO_DISCLAIMER = "ℹ️ <i>Automatic research. Not a trading recommendation or a safety verdict.</i>"
+
+
+def format_auto_research(mint: str, res, facts=None, pctx=None, alert_msg_id=None) -> str:
+    """The /re report (same sanitizers + scrubber) with an auto header, alert reference and disclaimer."""
+    body = format_research(mint, res, facts, pctx)
+    lines = body.split("\n")
+    name = E(facts.symbol) if facts is not None and facts.symbol else "Token"
+    head = [f"🧠 <b>Queen Auto Research</b> · {name}", f"<code>{E(mint)}</code>",
+            "↩️ <i>Follow-up to the claim alert above.</i>" if alert_msg_id else "↩️ <i>Follow-up to a GitClaim claim alert.</i>"]
+    rest = lines[1:]                                    # drop the /re header line (symbol + short CA)
+    foot = rest.pop() if rest else ""
+    return "\n".join(head + rest + [AUTO_DISCLAIMER, foot])

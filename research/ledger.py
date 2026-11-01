@@ -55,6 +55,9 @@ class Ledger:
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(requests)")}
+        if "source" not in cols:     # Phase 6 migration: manual | auto | direct (old rows = manual)
+            self._db.execute("ALTER TABLE requests ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
         self._lock = threading.Lock()
 
     def totals(self, day: str | None = None) -> dict:
@@ -64,12 +67,47 @@ class Ledger:
         t, d, hd, ht, n = self._db.execute(q, (day, day)).fetchone()
         return {"usd_total": t, "usd_today": d, "helius_today": hd, "helius_total": ht, "requests": n}
 
-    def reserve(self, *, settings, command: str, mode: str, model: str, effort: str, mint: str) -> tuple[int | None, BudgetDecision]:
-        """Atomic pre-request check + reservation. Returns (row id, decision)."""
+    def auto_totals(self, day: str | None = None) -> dict:
+        day = day or utc_day()
+        q = f"SELECT COALESCE(SUM({_USD}),0), COALESCE(SUM({_HEL}),0), COUNT(*) FROM requests WHERE source='auto' AND day=?"
+        u, h, n = self._db.execute(q, (day,)).fetchone()
+        return {"usd_today": u, "helius_today": h, "runs_today": n}
+
+    def record_direct_helius(self, method: str, credits: int = 1, command: str = "direct", mint: str | None = None) -> None:
+        """Durable record of a direct Helius RPC made by GitClaim's research path on QUEEN's key (/ho, /re context).
+        Queen's own RPCs are counted separately via its meter, so nothing is counted twice."""
+        now = time.time()
+        with self._lock:
+            self._db.execute("INSERT INTO requests(ts,day,command,mode,model,mint,status,reserved_usd,helius_reserved,"
+                             "helius_measured,cost_source,source) VALUES(?,?,?,?,?,?,'ok',0,0,?,'local_estimate','direct')",
+                             (now, utc_day(now), command, "direct", "helius:" + method, mint, int(credits)))
+
+    def helius_allowed(self, settings, need: int) -> BudgetDecision:
+        t = self.totals()
+        if t["helius_today"] + need > settings.helius_daily_credits:
+            return BudgetDecision(False, f"helius_daily: ~{t['helius_today']} credits today of {settings.helius_daily_credits}")
+        if t["helius_total"] + need > settings.helius_total_credits:
+            return BudgetDecision(False, f"helius_total: ~{t['helius_total']} credits of {settings.helius_total_credits}")
+        return BudgetDecision(True)
+
+    def reserve(self, *, settings, command: str, mode: str, model: str, effort: str, mint: str,
+                source: str = "manual", auto: dict | None = None) -> tuple[int | None, BudgetDecision]:
+        """Atomic pre-request check + reservation. Returns (row id, decision).
+        source='auto' must ALSO fit `auto` = {"daily_usd", "max_per_day", "daily_helius"}; missing/zero => refused."""
         wc = float(settings.worst_case_usd.get(model, max(settings.worst_case_usd.values())))
         with self._lock:
             t = self.totals()
             dec = BudgetDecision(True, None, t["usd_total"], t["usd_today"], t["helius_today"])
+            if source == "auto":
+                a, lim = self.auto_totals(), auto or {}
+                if a["runs_today"] + 1 > int(lim.get("max_per_day") or 0):
+                    dec.ok, dec.reason = False, f"auto_runs: {a['runs_today']} of {int(lim.get('max_per_day') or 0)} today"
+                elif a["usd_today"] + wc > float(lim.get("daily_usd") or 0):
+                    dec.ok, dec.reason = False, f"auto_daily_usd: ${a['usd_today']:.4f} of ${float(lim.get('daily_usd') or 0):.2f}, next may cost ${wc:.2f}"
+                elif a["helius_today"] + settings.helius_worst_case > int(lim.get("daily_helius") or 0):
+                    dec.ok, dec.reason = False, f"auto_helius: ~{a['helius_today']} of {int(lim.get('daily_helius') or 0)} credits today"
+                if not dec.ok:
+                    return None, dec
             if t["usd_total"] + wc > settings.budget_total_usd:
                 dec.ok, dec.reason = False, f"total_budget: ${t['usd_total']:.4f} spent of ${settings.budget_total_usd:.2f}, next request may cost up to ${wc:.2f}"
             elif t["usd_today"] + wc > settings.budget_daily_usd:
@@ -81,10 +119,11 @@ class Ledger:
             if not dec.ok:
                 return None, dec
             now = time.time()
+            src = source if source in ("manual", "auto") else "manual"
             cur = self._db.execute(
-                "INSERT INTO requests(ts,day,command,mode,model,effort,mint,status,reserved_usd,helius_reserved,helius_est) "
-                "VALUES(?,?,?,?,?,?,?,'pending',?,?,?)",
-                (now, utc_day(now), command, mode, model, effort, mint, wc, settings.helius_worst_case, settings.helius_est_per_research))
+                "INSERT INTO requests(ts,day,command,mode,model,effort,mint,status,reserved_usd,helius_reserved,helius_est,source) "
+                "VALUES(?,?,?,?,?,?,?,'pending',?,?,?,?)",
+                (now, utc_day(now), command, mode, model, effort, mint, wc, settings.helius_worst_case, settings.helius_est_per_research, src))
             return cur.lastrowid, dec
 
     def finish(self, row_id: int, *, status: str, error: str | None = None, latency_ms: int | None = None,

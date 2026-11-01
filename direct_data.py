@@ -110,8 +110,18 @@ def queen_rpc_url() -> str | None:
     return f"https://mainnet.helius-rpc.com/?api-key={key}" if key else None
 
 
+HELIUS_SINK = [None]       # Phase 6: callable(method, credits) -> durable ledger (set by CommandService)
+HELIUS_CREDITS = {"getAsset": 10}   # local estimate; standard RPC methods ~1 credit. Provider billing is authoritative.
+
+
 def _rpc(url, method, params, http=requests):
     CALLS["helius:" + method] += 1
+    sink = HELIUS_SINK[0]
+    if sink is not None:
+        try:
+            sink(method, HELIUS_CREDITS.get(method, 1))
+        except Exception:
+            pass
     r = http.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=8)
     if not r.ok:
         raise IOError(f"HTTP {r.status_code}")

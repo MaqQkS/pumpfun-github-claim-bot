@@ -54,13 +54,15 @@ class ResearchAdapter:
         return out
 
     # ---- public entry -------------------------------------------------------------------------
-    def research(self, command_text: str, facts: ClaimFacts | None = None, context: str | None = None) -> ResearchResult:
+    def research(self, command_text: str, facts: ClaimFacts | None = None, context: str | None = None,
+                 source: str = "manual", auto: dict | None = None) -> ResearchResult:
         try:
-            return self._research(command_text, facts, context)
+            return self._research(command_text, facts, context, source, auto)
         except Exception as e:  # last line of defense: never propagate into the caller
             return ResearchResult(False, None, "Research failed unexpectedly.", f"internal:{type(e).__name__}")
 
-    def _research(self, text: str, facts: ClaimFacts | None, context: str | None = None) -> ResearchResult:
+    def _research(self, text: str, facts: ClaimFacts | None, context: str | None = None,
+                  source: str = "manual", auto: dict | None = None) -> ResearchResult:
         plan = route(text, self.s)
         if plan.error:
             msg = {"unavailable": plan.note, "deep_disabled": plan.note, "missing_mint": "Send a token mint (CA).",
@@ -72,6 +74,8 @@ class ResearchAdapter:
             return ResearchResult(False, plan, plan.note or "Answered directly without AI (not part of the adapter).", "direct_command")
         if facts is None or facts.mint != plan.mint:
             facts = ClaimFacts(mint=plan.mint)
+        if source == "auto" and plan.deep:
+            return ResearchResult(False, plan, "Automatic research never uses deep mode.", "deep_disabled")
         key = (plan.command, "deep" if plan.deep else "standard", plan.model, plan.mint)
         now = time.time()
         with self._lock:
@@ -88,7 +92,7 @@ class ResearchAdapter:
             r = fut.result()
             return ResearchResult(**{**r.__dict__, "deduped": True})
         try:
-            r = self._run(plan, facts, context)
+            r = self._run(plan, facts, context, source, auto)
             if r.ok:
                 with self._lock:
                     self._cache[key] = (time.time() + self.s.cache_ttl_s, r)
@@ -102,14 +106,15 @@ class ResearchAdapter:
             with self._lock:
                 self._inflight.pop(key, None)
 
-    def _run(self, plan: RoutePlan, facts: ClaimFacts, context: str | None = None) -> ResearchResult:
+    def _run(self, plan: RoutePlan, facts: ClaimFacts, context: str | None = None,
+             source: str = "manual", auto: dict | None = None) -> ResearchResult:
         from .formatter import format_result
         mode = "deep" if plan.deep else "standard"
         if not self._gate.acquire(timeout=1.0):
             return ResearchResult(False, plan, "Another research is running; try again shortly.", "busy_local")
         try:
             row, dec = self.ledger.reserve(settings=self.s, command=plan.command, mode=mode, model=plan.model,
-                                           effort=plan.effort, mint=plan.mint)
+                                           effort=plan.effort, mint=plan.mint, source=source, auto=auto)
             if row is None:
                 return ResearchResult(False, plan, f"Research paused: budget limit reached ({dec.reason}).", "budget")
             task = COMMANDS[plan.command].task

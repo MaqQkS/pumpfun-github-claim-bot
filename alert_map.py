@@ -74,6 +74,14 @@ class AlertMap:
             return None
         return {"ts": row[0], "mints": json.loads(row[1]), "sig": row[2], "meta": json.loads(row[3] or "{}")}
 
+    def find_by_sig(self, sig: str) -> dict:
+        """{chat_id: message_id} of alerts GitClaim delivered for this claim tx."""
+        try:
+            with self._lock, self._conn() as c:
+                return {r[0]: r[1] for r in c.execute("SELECT chat, msg FROM alerts WHERE sig=?", (sig,))}
+        except Exception:
+            return {}
+
     def prune(self) -> int:
         try:
             with self._lock, self._conn() as c:

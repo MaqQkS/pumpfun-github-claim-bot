@@ -342,7 +342,25 @@ def _status():
     return {"ws_connected": WS_STATE["connected"], "last_ws_msg": WS_STATE["last_msg"], "subscribers": len(state["subscribers"]),
             "helius_calls": sum(n for m, n in CALLS.items() if ":" not in m)}
 
-CMDS = tc.CommandService(tc.CmdConfig.from_env(), tg_reply_html, tc.BotContext(_status, _facts_for, _github_ids_for))
+def tg_reply_to(chat, text, reply_to):
+    """Auto research report: reply to the original alert in the opted-in chat only. Returns delivered?"""
+    try:
+        body = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        if reply_to: body["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+        r = _tg_session().post(f"{TGAPI}/sendMessage", json=body, timeout=15)
+        if not r.ok:
+            log.warning("tg auto report %s failed: %s; retrying plain", chat, r.text[:200])
+            body.pop("parse_mode"); body["text"] = html_to_plain(text)
+            r = _tg_session().post(f"{TGAPI}/sendMessage", json=body, timeout=15)
+        return r.ok
+    except Exception as e: log.warning("tg auto report %s: %s", chat, type(e).__name__); _tls.s = None; return False
+
+CMDS = tc.CommandService(tc.CmdConfig.from_env(), tg_reply_html, tc.BotContext(_status, _facts_for, _github_ids_for),
+                         send_reply=tg_reply_to)
+from auto_research import AutoConfig, JobStore, AutoResearch
+AUTO = AutoResearch(AutoConfig.from_env(min_sol=MIN_FIRST_CLAIM_SOL), JobStore(os.path.join(DIR, "research", "data", "auto_jobs.sqlite3")),
+                    CMDS, ALERTS)
+CMDS.auto_max_queue = AUTO.cfg.max_queue
 
 def tg_handle_update(u):
     """Runs on the poll thread: subscription changes inline (state only), everything else handed to CMDS workers."""
@@ -574,7 +592,45 @@ def _alert_meta(cc, mint, sig, kind, hits, text):
     except Exception as e:
         log.warning("alert meta failed: %s", type(e).__name__); return None
 
-def handle_sig(sig, send=True, prefix=""):
+_SIG_LOCK = threading.Lock(); _SIG_INPROG = set()   # Phase 6: ws + catch-up can never process one sig twice at once
+
+def handle_sig(sig, send=True, prefix="", origin="live"):
+    if not send: return _handle_sig(sig, send, prefix, origin)
+    with _SIG_LOCK:
+        if sig in state["seen"] or sig in _SIG_INPROG: return None
+        _SIG_INPROG.add(sig)
+    try: return _handle_sig(sig, send, prefix, origin)
+    finally:
+        with _SIG_LOCK: _SIG_INPROG.discard(sig)
+
+def _auto_after_alert(sig, kind, mint, lam, hits, cc, meta, origin):
+    """Phase 6: hand the already-sent alert to auto research (decision + enqueue only; never blocks/raises)."""
+    try:
+        from auto_research import AlertEvent
+        ev = AlertEvent(sig=sig, kind=kind, mint=mint, mints=[m for _, m, _ in hits if m],
+                        share_sol=((lam if lam is not None else cc["amount"]) / 1e9), origin=origin,
+                        tags=tuple(cc.get("tags", [])), facts=(meta or {}).get("facts"))
+        AUTO.on_alert(ev)
+    except Exception as e: log.warning("auto research hook failed: %s", type(e).__name__)
+
+def catchup_once():
+    """Phase 6, CATCHUP_ENABLED only: bounded recovery of claims missed while the bot was down. Uses the normal
+    detection path (handle_sig, origin='catchup'), oldest first, deduped by state['seen']; never auto-researched."""
+    cfg = AUTO.cfg
+    if not cfg.catchup_enabled or cfg.catchup_max_sigs <= 0: return 0
+    sigs = rpc("getSignaturesForAddress", [WS_MENTION, {"limit": cfg.catchup_max_sigs, "commitment": "confirmed"}]) or []
+    cutoff = time.time() - cfg.catchup_window_s
+    todo = [x["signature"] for x in sigs if not x.get("err") and (x.get("blockTime") or 0) >= cutoff and x["signature"] not in state["seen"]]
+    log.info("CATCHUP %d candidate sigs in last %ds (max %d)", len(todo), cfg.catchup_window_s, cfg.catchup_max_sigs)
+    n = 0
+    for sig in reversed(todo):          # RPC returns newest first; process oldest first to keep FIRST/REPEAT order
+        try:
+            if handle_sig(sig, send=True, origin="catchup"): n += 1
+        except Exception as e: log.warning("catchup %s failed: %s", sig[:12], type(e).__name__)
+    log.info("CATCHUP done: %d alert(s) recovered", n)
+    return n
+
+def _handle_sig(sig, send=True, prefix="", origin="live"):
     if send and sig in state["seen"]: return None
     t = get_tx(sig)
     if not t or t["meta"].get("err"): return None
@@ -609,7 +665,9 @@ def handle_sig(sig, send=True, prefix=""):
                 if len(hits) > 8: extra.append(f"• +{len(hits)-8} more")
                 text = text.replace("\n\n🔗 ", "\n\n➕ Also first claims:\n" + "\n".join(extra) + "\n\n🔗 ", 1)
             text = prefix + text; msgs.append(text); log.info("ALERT\n%s", text)
-            if send: tg_send_all(text, _alert_meta(cc, mint, sig, kind, hits, text))
+            meta = _alert_meta(cc, mint, sig, kind, hits, text) if send else None
+            if send: tg_send_all(text, meta)
+            if send: _auto_after_alert(sig, kind, mint, lam, hits, cc, meta, origin)
     if send:
         state["seen"] = (state["seen"] + [sig])[-2000:]
     save_state(state)
@@ -661,6 +719,11 @@ def main():
     threading.Thread(target=tg_supervisor, daemon=True).start()
     threading.Thread(target=log_usage_loop, daemon=True).start()
     threading.Thread(target=authority_check_loop, daemon=True).start()
+    tc.dd.HELIUS_SINK[0] = CMDS._record_helius    # durable Helius accounting for research reads (Queen's key); runtime only
+    AUTO.recover()
+    log.info("auto research %s (chats=%d, max/day=%d, $%.2f/day) · catch-up %s", "ON" if AUTO.cfg.enabled else "off",
+             len(AUTO.cfg.chats), AUTO.cfg.max_per_day, AUTO.cfg.daily_usd, "ON" if AUTO.cfg.catchup_enabled else "off")
+    if AUTO.cfg.catchup_enabled: threading.Thread(target=catchup_once, daemon=True).start()
     asyncio.run(ws_loop())
 
 if __name__ == "__main__": main()
