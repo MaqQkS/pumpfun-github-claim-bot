@@ -54,6 +54,52 @@ def preserve_addresses(text: str, canonical: list[str]) -> AddressReport:
     return rep
 
 
+URL_RE = re.compile(r"https?://[^\s<>\"')\],]+")
+URL_ADDR = re.compile(r"[0-9A-Za-z]{32,88}")
+
+
+@dataclass
+class UrlReport:
+    text: str
+    kept: list = field(default_factory=list)
+    restored: list = field(default_factory=list)     # (bad_url, fixed_url) case restored from trusted input
+    dropped: list = field(default_factory=list)
+
+
+def sanitize_urls(text: str, trusted: list[str]) -> UrlReport:
+    """Every address/signature-like path or query component of a URL must exactly match a trusted value
+    (GitClaim facts). A case-insensitive match is restored to the trusted canonical form; anything else drops
+    the whole URL with a note. URLs without address-like components are kept unchanged. Never builds URLs."""
+    canon = {a for a in trusted if a}
+    by_lower = {a.lower(): a for a in canon}
+    rep = UrlReport(text)
+
+    def sub(m: re.Match) -> str:
+        url = m.group(0)
+        trail = ""
+        while url and url[-1] in ".;:!?":
+            trail = url[-1] + trail; url = url[:-1]
+        host_end = url.find("/", url.find("//") + 2)
+        host, rest = (url, "") if host_end < 0 else (url[:host_end], url[host_end:])
+        fixed, ok = rest, True
+        for tok in set(URL_ADDR.findall(rest)):
+            if tok in canon:
+                continue
+            c = by_lower.get(tok.lower())
+            if c is None:
+                ok = False; break
+            fixed = fixed.replace(tok, c)
+        if not ok:
+            rep.dropped.append(url)
+            return "[link omitted (unverified)]" + trail
+        if fixed != rest:
+            rep.restored.append((url, host + fixed))
+        rep.kept.append(host + fixed)
+        return host + fixed + trail
+    rep.text = URL_RE.sub(sub, text)
+    return rep
+
+
 def _fmt_facts(facts) -> list[str]:
     d = facts.as_data()
     order = [("mint", "Mint"), ("symbol", "Symbol"), ("name", "Name"), ("github_login", "GitHub-linked fee claimant"),
@@ -73,7 +119,8 @@ def _fmt_facts(facts) -> list[str]:
 
 def format_result(*, facts, answer, plan, usage: dict | None, latency_ms: int | None, at: datetime | None = None) -> tuple[str, AddressReport]:
     at = at or datetime.now(timezone.utc)
-    rep = preserve_addresses(answer.answer, facts.addresses())
+    urep = sanitize_urls(answer.answer, facts.addresses())
+    rep = preserve_addresses(urep.text, facts.addresses())
     ts = at.strftime("%Y-%m-%d %H:%M UTC")
     L = [f"A. Verified GitClaim facts (from the scanner, not from AI)"] + _fmt_facts(facts)
     L += ["", f"B. External on-chain / market data (read by Queen's tools at {ts})"]
@@ -83,7 +130,10 @@ def format_result(*, facts, answer, plan, usage: dict | None, latency_ms: int | 
     else:
         L.append("- No tool reads reported.")
     if answer.sources:
-        L.append("- Sources: " + ", ".join(s if isinstance(s, str) else str(s.get("url") or s.get("title") or s) for s in answer.sources[:12]))
+        raw = [s if isinstance(s, str) else str(s.get("url") or s.get("title") or s) for s in answer.sources[:12]]
+        srep = sanitize_urls("\n".join(raw), facts.addresses())
+        urep.dropped += srep.dropped; urep.restored += srep.restored
+        L.append("- Sources: " + ", ".join(x for x in srep.text.split("\n") if x))
     L.append("- Figures in C that came from these tools are relayed by the model; the adapter does not re-verify them.")
     L += ["", f"C. AI interpretation ({plan.model}, reasoning {plan.effort}; interpretation, not verified fact)", rep.text.strip()]
     lim = []
@@ -91,6 +141,10 @@ def format_result(*, facts, answer, plan, usage: dict | None, latency_ms: int | 
         lim.append(plan.note)
     if usage and usage.get("http_errors"):
         lim.append("Upstream errors: " + ", ".join(sorted(set(usage["http_errors"]))))
+    if urep.restored:
+        lim.append(f"{len(urep.restored)} link(s) had wrong letter case in an address and were restored from verified GitClaim data.")
+    if urep.dropped:
+        lim.append(f"{len(urep.dropped)} link(s) omitted: their address/signature did not exactly match verified data.")
     if rep.fixed:
         lim.append(f"{len(rep.fixed)} address(es) in the AI text had wrong letter case and were restored from verified data.")
     if rep.unverified:

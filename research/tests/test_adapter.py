@@ -354,10 +354,12 @@ class TestPromptAndFixtures(unittest.TestCase):
 
 class TestIsolation(unittest.TestCase):
     def test_bot_untouched(self):
-        d = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "bot.py", "start.sh", "run.sh"], cwd=REPO)
-        self.assertEqual(d.returncode, 0, "bot.py/start.sh/run.sh changed")
+        # Phase 3 intentionally changes bot.py's Telegram handling (alert output is checked byte-for-byte in
+        # tests/test_phase3.py). run.sh/start.sh stay as on main, and bot.py still never imports research at module level.
+        d = subprocess.run(["git", "diff", "--quiet", "main", "--", "start.sh", "run.sh"], cwd=REPO)
+        self.assertEqual(d.returncode, 0, "start.sh/run.sh changed")
         src = (REPO / "bot.py").read_text()
-        self.assertNotRegex(src, r"(?m)^\s*(from|import)\s+research\b")
+        self.assertNotRegex(src, r"(?m)^(from|import)\s+research\b")
 
     def test_no_secrets_in_new_files(self):
         secrets = []

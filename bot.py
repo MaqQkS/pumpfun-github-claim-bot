@@ -257,32 +257,93 @@ def tg_reply(chat, text):
     try: requests.post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": text}, timeout=15)
     except Exception as e: log.warning("tg reply %s: %s", chat, e)
 
+def tg_reply_html(chat, text):
+    """Command replies: only to the requesting chat (never tg_send_all). HTML, plain-text fallback."""
+    try:
+        r = requests.post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
+        if not r.ok:
+            log.warning("tg cmd reply %s failed: %s; retrying plain", chat, r.text[:200])
+            requests.post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": html_to_plain(text), "disable_web_page_preview": True}, timeout=15)
+    except Exception as e: log.warning("tg cmd reply %s: %s", chat, e)
+
+# ---- Telegram commands (Phase 3). One bot identity; research goes to Queen via research/ (local HTTP). ----
+import telegram_cmds as tc
+from collections import deque
+BOT_USERNAME = [os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@") or None]   # filled from getMe if unset
+WS_STATE = {"connected": None, "last_msg": None}
+_SEEN_UPDATES = deque(maxlen=2000)
+
+def _github_ids_for(mint):
+    return [k.split(":", 1)[0] for k in state.get("pairs", []) if k.split(":", 1)[1:] == [mint]]
+
+def _facts_for(mint):
+    from research.fixtures import find
+    from research.prompt import ClaimFacts
+    try:
+        with open(os.path.join(DIR, "bot.log"), "rb") as f:
+            f.seek(0, 2); f.seek(max(0, f.tell() - 5_000_000))
+            facts = find(f.read().decode("utf8", "replace"), mint)
+        if facts: return facts
+    except OSError: pass
+    ids = _github_ids_for(mint)
+    if ids:
+        login, name = github_login(ids[0])
+        return ClaimFacts(mint=mint, github_login=login, github_display=name,
+                          github_url=f"https://github.com/{login}" if login else None, github_profile=github_stats(ids[0]))
+    return None
+
+def _status():
+    return {"ws_connected": WS_STATE["connected"], "last_ws_msg": WS_STATE["last_msg"], "subscribers": len(state["subscribers"]),
+            "helius_calls": sum(n for m, n in CALLS.items() if ":" not in m)}
+
+CMDS = tc.CommandService(tc.CmdConfig.from_env(), tg_reply_html, tc.BotContext(_status, _facts_for, _github_ids_for))
+
 def tg_handle_update(u):
+    """Runs on the poll thread: subscription changes inline (state only), everything else handed to CMDS workers."""
+    uid = u.get("update_id")
+    if uid in _SEEN_UPDATES: log.info("update %s already handled; skipped", uid); return
+    _SEEN_UPDATES.append(uid)
     kinds = [k for k in u if k != "update_id"]
-    msg = u.get("message") or u.get("edited_message") or u.get("channel_post") or {}
+    if "edited_message" in u:   # edits never (re)run commands
+        log.info("update %s edited_message ignored", uid); return
+    msg = u.get("message") or u.get("channel_post") or {}
     chat = (msg.get("chat") or {}).get("id")
+    user = (msg.get("from") or {}).get("id")
     txt = (msg.get("text") or "").strip()
     mcm = u.get("my_chat_member")
-    if mcm:  # user pressed Start / blocked the bot
+    if mcm:  # bot added/removed/blocked. Removal unsubscribes; being added does NOT subscribe (needs /start)
         chat = mcm["chat"]["id"]; status = mcm.get("new_chat_member", {}).get("status")
-        log.info("update %s my_chat_member chat=%s status=%s", u["update_id"], chat, status)
-        if status in ("kicked", "left"):
-            if chat in state["subscribers"]: state["subscribers"].remove(chat); log.info("UNSUBSCRIBED %s (blocked)", chat)
-            return
-        txt = "/start"
-    log.info("update %s kinds=%s chat=%s text=%r", u["update_id"], kinds, chat, txt[:40])
+        log.info("update %s my_chat_member chat=%s status=%s", uid, chat, status)
+        if status in ("kicked", "left") and chat in state["subscribers"]:
+            state["subscribers"].remove(chat); log.info("UNSUBSCRIBED %s (blocked)", chat)
+        return
+    log.info("update %s kinds=%s chat=%s text=%r", uid, kinds, chat, txt[:40])
     if not chat: return
-    if txt.lower().startswith("/stop"):
+    p = tc.parse_command(txt, BOT_USERNAME[0])
+    if p is None: return   # plain text, or a command for another bot
+    if p.name == "stop" and not p.deep:
         if chat in state["subscribers"]: state["subscribers"].remove(chat)
         log.info("UNSUBSCRIBED %s", chat); tg_reply(chat, "Unsubscribed. Send /start to resubscribe."); return
-    if chat not in state["subscribers"]:
-        state["subscribers"].append(chat); log.info("SUBSCRIBED %s (total %d)", chat, len(state["subscribers"]))
-        tg_reply(chat, "✅ Subscribed. You'll get an alert when a GitHub-linked account claims pump.fun fees for the FIRST time. /stop to unsubscribe.")
-    elif txt.lower().startswith("/start"):
-        tg_reply(chat, "✅ Already subscribed. /stop to unsubscribe.")
+    if p.name == "start" and not p.deep:
+        if chat not in state["subscribers"]:
+            state["subscribers"].append(chat); log.info("SUBSCRIBED %s (total %d)", chat, len(state["subscribers"]))
+            tg_reply(chat, "✅ Subscribed. You'll get an alert when a GitHub-linked account claims pump.fun fees for the FIRST time. /stop to unsubscribe.")
+        else:
+            tg_reply(chat, "✅ Already subscribed. /stop to unsubscribe.")
+        return
+    CMDS.handle(chat, user, p)   # access check + enqueue only; never blocks on network
+
+def tg_bot_username():
+    if BOT_USERNAME[0]: return BOT_USERNAME[0]
+    try:
+        j = requests.get(f"{TGAPI}/getMe", timeout=10).json()
+        if j.get("ok"): BOT_USERNAME[0] = j["result"].get("username"); log.info("bot username @%s", BOT_USERNAME[0])
+    except Exception as e: log.warning("getMe failed: %s", str(e)[:120])
+    return BOT_USERNAME[0]
 
 def tg_poll():
     log.info("tg poll started (offset %s, %d subscribers)", state["tg_offset"], len(state["subscribers"]))
+    tg_bot_username()
     while True:
         try:
             r = requests.get(f"{TGAPI}/getUpdates", params={"offset": state["tg_offset"], "timeout": 25,
@@ -506,15 +567,16 @@ async def ws_loop():
             async with websockets.connect(WSS, ping_interval=30, ping_timeout=20, max_size=2**22) as ws:
                 await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
                                           "params": [{"mentions": [WS_MENTION]}, {"commitment": "confirmed"}]}))
-                log.info("ws connected (%s), logs mentioning %s", WSS_NAME, WS_MENTION); backoff = 1
+                log.info("ws connected (%s), logs mentioning %s", WSS_NAME, WS_MENTION); backoff = 1; WS_STATE["connected"] = True
                 async for raw in ws:
-                    WS_BYTES[0] += len(raw)
+                    WS_BYTES[0] += len(raw); WS_STATE["last_msg"] = time.time()
                     v = json.loads(raw).get("params", {}).get("result", {}).get("value")
                     if not v or v.get("err"): continue
                     if not any("Instruction: ClaimSocialFeePda" in l for l in v.get("logs", [])): continue
                     asyncio.get_running_loop().run_in_executor(None, handle_sig, v["signature"])
         except Exception as e:
             log.warning("ws error: %s; reconnect in %ss", str(e)[:200], backoff)
+        WS_STATE["connected"] = False
         await asyncio.sleep(backoff); backoff = min(backoff * 2, 60)
 
 def main():
