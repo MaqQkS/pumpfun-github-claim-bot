@@ -6,3 +6,8 @@ state.json
 state.json.tmp
 *.log
 .env
+
+# research adapter (Phase 2)
+research/data/*
+!research/data/.gitkeep
+research/research.env

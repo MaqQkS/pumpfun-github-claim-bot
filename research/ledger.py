@@ -1,0 +1,108 @@
+"""Persistent usage ledger + budget gate (SQLite, separate from the bot's state.json).
+
+Accounting rule (conservative): a request counts against the budget at its worst-case reservation
+until real usage replaces it. If real usage never arrives (timeout after Queen started, crash),
+the reservation stays counted. Requests that never reached Queen (connection refused) count 0.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL, day TEXT NOT NULL,
+  command TEXT, mode TEXT, model TEXT, effort TEXT, mint TEXT,
+  status TEXT NOT NULL,            -- pending | ok | error | not_sent
+  error TEXT,
+  reserved_usd REAL NOT NULL DEFAULT 0,
+  est_usd REAL, actual_usd REAL, cost_source TEXT,
+  input_tokens INTEGER, cached_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
+  llm_calls INTEGER, models_seen TEXT,
+  helius_reserved INTEGER NOT NULL DEFAULT 0, helius_est INTEGER, helius_measured INTEGER,
+  latency_ms INTEGER, tools TEXT
+);
+"""
+
+
+def utc_day(ts: float | None = None) -> str:
+    return datetime.fromtimestamp(ts if ts is not None else time.time(), timezone.utc).strftime("%Y-%m-%d")
+
+
+@dataclass
+class BudgetDecision:
+    ok: bool
+    reason: str | None = None
+    spent_total: float = 0.0
+    spent_today: float = 0.0
+    helius_today: int = 0
+
+
+# Charge expression: real cost if known, else the reservation (unknown = assume worst case)
+_USD = "CASE WHEN status='not_sent' THEN 0 WHEN actual_usd IS NOT NULL THEN actual_usd ELSE reserved_usd END"
+_HEL = "CASE WHEN status='not_sent' THEN 0 WHEN helius_measured IS NOT NULL THEN helius_measured ELSE helius_reserved END"
+
+
+class Ledger:
+    def __init__(self, path: str):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.executescript(SCHEMA)
+        self._lock = threading.Lock()
+
+    def totals(self, day: str | None = None) -> dict:
+        day = day or utc_day()
+        q = f"SELECT COALESCE(SUM({_USD}),0), COALESCE(SUM(CASE WHEN day=? THEN {_USD} ELSE 0 END),0), " \
+            f"COALESCE(SUM(CASE WHEN day=? THEN {_HEL} ELSE 0 END),0), COALESCE(SUM({_HEL}),0), COUNT(*) FROM requests"
+        t, d, hd, ht, n = self._db.execute(q, (day, day)).fetchone()
+        return {"usd_total": t, "usd_today": d, "helius_today": hd, "helius_total": ht, "requests": n}
+
+    def reserve(self, *, settings, command: str, mode: str, model: str, effort: str, mint: str) -> tuple[int | None, BudgetDecision]:
+        """Atomic pre-request check + reservation. Returns (row id, decision)."""
+        wc = float(settings.worst_case_usd.get(model, max(settings.worst_case_usd.values())))
+        with self._lock:
+            t = self.totals()
+            dec = BudgetDecision(True, None, t["usd_total"], t["usd_today"], t["helius_today"])
+            if t["usd_total"] + wc > settings.budget_total_usd:
+                dec.ok, dec.reason = False, f"total_budget: ${t['usd_total']:.4f} spent of ${settings.budget_total_usd:.2f}, next request may cost up to ${wc:.2f}"
+            elif t["usd_today"] + wc > settings.budget_daily_usd:
+                dec.ok, dec.reason = False, f"daily_budget: ${t['usd_today']:.4f} spent today of ${settings.budget_daily_usd:.2f}, next request may cost up to ${wc:.2f}"
+            elif t["helius_today"] + settings.helius_worst_case > settings.helius_daily_credits:
+                dec.ok, dec.reason = False, f"helius_daily: ~{t['helius_today']} credits today of {settings.helius_daily_credits}"
+            elif t["helius_total"] + settings.helius_worst_case > settings.helius_total_credits:
+                dec.ok, dec.reason = False, f"helius_total: ~{t['helius_total']} credits of {settings.helius_total_credits}"
+            if not dec.ok:
+                return None, dec
+            now = time.time()
+            cur = self._db.execute(
+                "INSERT INTO requests(ts,day,command,mode,model,effort,mint,status,reserved_usd,helius_reserved,helius_est) "
+                "VALUES(?,?,?,?,?,?,?,'pending',?,?,?)",
+                (now, utc_day(now), command, mode, model, effort, mint, wc, settings.helius_worst_case, settings.helius_est_per_research))
+            return cur.lastrowid, dec
+
+    def finish(self, row_id: int, *, status: str, error: str | None = None, latency_ms: int | None = None,
+               tools: list | None = None, usage: dict | None = None, est_usd: float | None = None) -> None:
+        u = usage or {}
+        with self._lock:
+            self._db.execute(
+                "UPDATE requests SET status=?, error=?, latency_ms=?, tools=?, est_usd=?, actual_usd=?, cost_source=?, "
+                "input_tokens=?, cached_tokens=?, output_tokens=?, reasoning_tokens=?, llm_calls=?, models_seen=?, helius_measured=? WHERE id=?",
+                (status, (error or None) and str(error)[:300], latency_ms, json.dumps(tools) if tools is not None else None, est_usd,
+                 u.get("actual_usd"), u.get("cost_source"), u.get("input_tokens"), u.get("cached_tokens"), u.get("output_tokens"),
+                 u.get("reasoning_tokens"), u.get("llm_calls"), json.dumps(u.get("models")) if u.get("models") else None,
+                 u.get("helius_credits"), row_id))
+
+    def rows(self, limit: int = 50) -> list[dict]:
+        cur = self._db.execute("SELECT * FROM requests ORDER BY id DESC LIMIT ?", (limit,))
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    def close(self) -> None:
+        self._db.close()
