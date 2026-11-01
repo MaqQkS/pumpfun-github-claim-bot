@@ -635,7 +635,11 @@ def format_liquidity(mint: str, d: dict) -> str:
     if not d.get("ok"):
         return f"⚠️ Liquidity unavailable: {E(d.get('error', 'error'))}"
     if not d.get("pairs"):
-        return f"💧 No DexScreener pool for <code>{E(_short(mint))}</code> yet (bonding curve or not indexed)."
+        if str(mint).endswith("pump"):                                   # pump.fun mint, no pool yet -> bonding curve
+            if d.get("symbol"):
+                return f"💧 <b>${E(str(d['symbol']))}</b>: on bonding curve\n🔗 <code>{E(_short(mint))}</code>"
+            return f"💧 <code>{E(_short(mint))}</code>: on bonding curve"
+        return f"💧 No DexScreener pool found for <code>{E(_short(mint))}</code> (not indexed yet)."
     if str(d.get("dex")).lower() == "pumpfun" or d.get("liq_usd") is None:      # pump.fun bonding curve: no pool liquidity
         link = f'<a href="https://dexscreener.com/solana/{E(d["pair"])}">DexScreener</a> · ' if d.get("pair") else ""
         return "\n".join([f"💧 <b>${E(str(d.get('symbol') or '?'))}</b>: on bonding curve",
