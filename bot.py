@@ -266,16 +266,26 @@ def format_alert(c, mint, sig, kind="FIRST claim ever"):
 def html_to_plain(t):
     return html.unescape(re.sub(r"<a href=\"([^\"]*)\">([^<]*)</a>", r"\2: \1", re.sub(r"</?code>", "", t)))
 
-def tg_send_all(text):
+def _remember_alert(chat, r, meta):
+    """Phase 4: keep Telegram's returned message_id -> alert metadata. Never affects delivery."""
+    if not meta: return
+    try:
+        mid = r.json()["result"]["message_id"]
+        ALERTS.record(chat, mid, meta.get("mints") or [], meta.get("sig"), meta)
+    except Exception as e: log.warning("alert map record failed: %s", type(e).__name__)
+
+def tg_send_all(text, meta=None):
     for chat in list(state["subscribers"]):
         try:
             r = requests.post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
+            if r.ok: _remember_alert(chat, r, meta)
             if r.status_code == 403:
                 state["subscribers"].remove(chat); save_state(state); log.info("removed blocked chat %s", chat); continue
             if not r.ok:
                 log.warning("tg HTML send %s failed: %s; retrying plain", chat, r.text[:200])
                 r = requests.post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": html_to_plain(text), "disable_web_page_preview": True}, timeout=15)
                 if not r.ok: log.warning("tg plain send %s: %s", chat, r.text[:200])
+                else: _remember_alert(chat, r, meta)
         except Exception as e: log.warning("tg send error: %s", e)
 
 def tg_reply(chat, text):
@@ -303,6 +313,11 @@ from collections import deque
 BOT_USERNAME = [os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@") or None]   # filled from getMe if unset
 WS_STATE = {"connected": None, "last_msg": None}
 _SEEN_UPDATES = deque(maxlen=2000)
+BOT_ID = [None]                         # from getMe; reply context is accepted only from this id
+from alert_map import AlertMap, resolve_reply, REPLY_COMMANDS
+ALERTS = AlertMap(os.path.join(DIR, "research", "data", "alert_map.sqlite3"))
+try: ALERTS.prune()
+except Exception: pass
 
 def _github_ids_for(mint):
     return [k.split(":", 1)[0] for k in state.get("pairs", []) if k.split(":", 1)[1:] == [mint]]
@@ -363,13 +378,17 @@ def tg_handle_update(u):
         else:
             tg_reply(chat, "✅ Already subscribed. /stop to unsubscribe.")
         return
-    CMDS.handle(chat, user, p, t_recv)   # access check + enqueue only; never blocks on network
+    reply = None
+    if p.name in REPLY_COMMANDS and msg.get("reply_to_message") and CMDS.allowed(chat, user):
+        reply = resolve_reply(msg, BOT_ID[0], ALERTS)   # local sqlite + text parse only; no network
+        if reply: log.info("cmd /%s reply-to msg %s -> %s", p.name, msg["reply_to_message"].get("message_id"), reply.source or "rejected")
+    CMDS.handle(chat, user, p, t_recv, reply)   # access check + enqueue only; never blocks on network
 
 def tg_bot_username():
-    if BOT_USERNAME[0]: return BOT_USERNAME[0]
+    if BOT_USERNAME[0] and BOT_ID[0]: return BOT_USERNAME[0]
     try:
         j = requests.get(f"{TGAPI}/getMe", timeout=10).json()
-        if j.get("ok"): BOT_USERNAME[0] = j["result"].get("username"); log.info("bot username @%s", BOT_USERNAME[0])
+        if j.get("ok"): BOT_USERNAME[0] = j["result"].get("username"); BOT_ID[0] = j["result"].get("id"); log.info("bot username @%s", BOT_USERNAME[0])
     except Exception as e: log.warning("getMe failed: %s", str(e)[:120])
     return BOT_USERNAME[0]
 
@@ -542,6 +561,19 @@ def is_muted(uid):
     login = github_login(uid)[0]
     return bool(login) and login.lower() in m
 
+def _alert_meta(cc, mint, sig, kind, hits, text):
+    """Verified metadata for the alert map, built from the same data the alert was made from (never from Telegram)."""
+    try:
+        from research.fixtures import parse_alerts
+        mints = [m for _, m, _ in hits if m]
+        facts = parse_alerts(time.strftime("%Y-%m-%d %H:%M:%S") + ",000 INFO ALERT\n" + text)
+        f = facts[0].as_data() if facts and mint and facts[0].mint == mint else None
+        if f: f["claim_time"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+        return {"mints": mints, "sig": sig, "kind": kind, "github_ids": [str(cc.get("user_id"))] if cc.get("user_id") else [],
+                "facts": f, "recorded": time.time()}
+    except Exception as e:
+        log.warning("alert meta failed: %s", type(e).__name__); return None
+
 def handle_sig(sig, send=True, prefix=""):
     if send and sig in state["seen"]: return None
     t = get_tx(sig)
@@ -577,7 +609,7 @@ def handle_sig(sig, send=True, prefix=""):
                 if len(hits) > 8: extra.append(f"• +{len(hits)-8} more")
                 text = text.replace("\n\n🔗 ", "\n\n➕ Also first claims:\n" + "\n".join(extra) + "\n\n🔗 ", 1)
             text = prefix + text; msgs.append(text); log.info("ALERT\n%s", text)
-            if send: tg_send_all(text)
+            if send: tg_send_all(text, _alert_meta(cc, mint, sig, kind, hits, text))
     if send:
         state["seen"] = (state["seen"] + [sig])[-2000:]
     save_state(state)

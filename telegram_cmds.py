@@ -17,7 +17,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -209,12 +209,14 @@ class _Job:
     key: tuple
     facts: object = None
     enqueued: float = field(default_factory=time.time)
+    origin: str | None = None        # reply-to-alert: "stored" | "parsed"; None for /re <CA>
 
 
 class CommandService:
     def __init__(self, cfg: CmdConfig, send, ctx: BotContext | None = None, *, adapter_factory=None, http=None,
                  rpc_url: str | None = None):
         self.cfg, self.send, self.ctx = cfg, send, ctx or BotContext()
+        self._reply_ctx = None
         self._adapter_factory = adapter_factory or _default_adapter
         self._adapter = None
         self.http = http or dd.requests
@@ -234,11 +236,20 @@ class CommandService:
         return self.cfg.enabled and chat_id in self.cfg.chats and user_id in self.cfg.testers
 
     # entry point from the poll thread: must not block -----------------------
-    def handle(self, chat_id: int, user_id: int | None, p: Parsed, t_recv: float | None = None) -> bool:
-        """Returns True when the command was accepted (reply will follow), False when ignored."""
+    def handle(self, chat_id: int, user_id: int | None, p: Parsed, t_recv: float | None = None, reply=None) -> bool:
+        """Returns True when the command was accepted (reply will follow), False when ignored.
+        `reply` is an alert_map.Resolution when the command replied to a message (Phase 4), else None."""
         if not self.allowed(chat_id, user_id):
             log.info("cmd /%s ignored (chat=%s user=%s not allowlisted or commands disabled)", p.name, chat_id, user_id)
             return False
+        self._reply_ctx = None                  # only read synchronously on the poll thread (captured for /gh)
+        if reply is not None and p.known and not p.deep and p.name in REPLY_COMMANDS and not _explicit_target(p):
+            if reply.error:
+                msg = _choices_text(p.name, reply.choices) if reply.error == "multi" else reply.error
+                self._submit_direct(("reply-err", chat_id), lambda: msg, chat_id)
+                return True
+            p = replace(p, args=(reply.mint,) + tuple(p.args))
+            self._reply_ctx = reply
         key = (chat_id, p.name, p.deep, p.args)
         with self._lock:
             if key in self._inflight:
@@ -285,7 +296,8 @@ class CommandService:
             return self._enqueue_research(chat, p, key)
         handler = getattr(self, "_cmd_" + spec.name)
         note = "ℹ️ Deep analysis doesn't apply to this command; normal result below.\n\n" if p.deep else ""
-        self._submit_direct(key, lambda: note + handler(p.args), chat, track=True)
+        rc = self._reply_ctx
+        self._submit_direct(key, lambda: note + (handler(p.args, rc) if spec.name == "github" else handler(p.args)), chat, track=True)
         return True
 
     def _submit_direct(self, key, fn, chat, track=False):
@@ -322,9 +334,13 @@ class CommandService:
         mint = next((a for a in p.args if dd.is_mint(a)), None)
         if not mint:
             self._done(key)
-            self._submit_direct(key, lambda: "Send a CA: <code>/re &lt;CA&gt;</code> (base58, 32–44 chars). Reply-to-alert comes later.", chat)
+            self._submit_direct(key, lambda: "Send a CA: <code>/re &lt;CA&gt;</code> (base58, 32–44 chars). Or reply <code>/re</code> to a GitClaim alert.", chat)
             return True
         job = _Job(chat, mint, key)
+        rc = getattr(self, "_reply_ctx", None)
+        if rc is not None and rc.mint == mint:
+            job.origin = rc.source
+            job.facts = facts_from_meta(rc.meta, mint) if rc.source == "stored" else None
         job.enqueued = getattr(self, "_t_recv", time.time())
         with self._lock:
             busy = self._running is not None
@@ -384,10 +400,12 @@ class CommandService:
         return self._adapter
 
     def _run_research(self, job: _Job) -> str:
-        try:
-            facts = self.ctx.facts_for(job.mint)
-        except Exception:
-            facts = None
+        facts = job.facts                       # stored verified alert metadata (reply-to-alert) wins
+        if facts is None:
+            try:
+                facts = self.ctx.facts_for(job.mint)
+            except Exception:
+                facts = None
         import project_context as pc
         pctx = None
         try:                                                        # free reads, inside the single research slot
@@ -398,7 +416,7 @@ class CommandService:
             log.warning("re context failed: %s", type(e).__name__)
         self.llm_calls += 1
         res = self.adapter().research(f"re {job.mint}", facts, pc.context_block(pctx) if pctx else None)
-        return format_research(job.mint, res, facts, pctx)
+        return format_research(job.mint, res, facts, pctx, origin=job.origin)
 
     # ---- direct handlers (no LLM) ------------------------------------------
     def _mint_arg(self, args):
@@ -426,12 +444,13 @@ class CommandService:
         d = dd.holders(mint, http=self.http, rpc_url=self.rpc_url, pool_hint=lq.get("pair") if lq.get("ok") else None)
         return format_holders(mint, d, lq)
 
-    def _cmd_github(self, args):
+    def _cmd_github(self, args, rc=None):
         if not args:
             return "Send a GitHub user, owner/repo or a CA: <code>/gh NubsCarson</code>"
         a = args[0].strip().removeprefix("https://github.com/").removeprefix("github.com/").strip("/")
         if dd.is_mint(a) and "/" not in a and (len(a) >= 32):
-            ids = list(dict.fromkeys(self.ctx.github_ids_for(a) or []))
+            stored = [str(i) for i in (rc.meta.get("github_ids") or [])] if rc is not None and rc.mint == a and rc.meta else []
+            ids = list(dict.fromkeys(stored or self.ctx.github_ids_for(a) or []))
             if not ids:
                 return f"🐙 No linked GitHub claim found for <code>{E(_short(a))}</code> (GitClaim has not seen a GitHub fee claim on this coin). Try <code>/re {E(a)}</code> for its narrative."
             blocks = [format_github(dd.github_user(uid=i, http=self.http)) for i in ids[:3]]
@@ -538,7 +557,7 @@ def format_github(d: dict) -> str:
     return "\n".join(L)
 
 
-_SEC = re.compile(r"^\W*(NARRATIVE|VERDICT|DATA)\W*:?\s*(.*)$", re.I)
+_SEC = re.compile(r"^\W*(NARRATIVE|VERDICT|DATA)[*_\s]*[:\-–]?[*_\s]*(.*)$", re.I)
 
 
 def _split_answer(text: str) -> dict:
@@ -554,7 +573,7 @@ def _split_answer(text: str) -> dict:
     return out
 
 
-def format_research(mint: str, res, facts=None, pctx=None) -> str:
+def format_research(mint: str, res, facts=None, pctx=None, origin=None) -> str:
     from research.formatter import preserve_addresses, sanitize_urls
     if not res.ok:
         msg = {"budget": "💸 ", "queen_unavailable": "⚪ "}.get(res.error or "", "⚠️ ")
@@ -573,6 +592,7 @@ def format_research(mint: str, res, facts=None, pctx=None) -> str:
     sym = (facts.symbol if facts is not None and facts.symbol else None)
     flags = " · cached" if res.cached else ""
     L = [f"🔎 <b>{E(sym) if sym else 'Research'}</b> · <code>{E(_short(mint))}</code>{flags}", "",
+         *([ORIGIN_NOTE[origin](facts)] if origin in ORIGIN_NOTE else []),
          "🧠 <b>AI take</b> <i>(interpretation)</i>", E(narrative if len(narrative) <= 450 else narrative[:447].rsplit(" ", 1)[0] + "…") if narrative else "No narrative returned."]
     if verdict:
         L.append(f"⚠️ {E(verdict[:240])}")
@@ -611,3 +631,44 @@ def format_research(mint: str, res, facts=None, pctx=None) -> str:
         meta.append(f"{res.latency_ms / 1000:.1f}s")
     L.append(" · ".join(meta))
     return "\n".join(L)
+
+
+# ---- Phase 4: reply-to-alert helpers ---------------------------------------------------------
+from alert_map import REPLY_COMMANDS  # noqa: E402
+
+ORIGIN_NOTE = {
+    "stored": lambda f: "📎 <i>From the replied-to alert (GitClaim's stored record).</i>\n",
+    "parsed": lambda f: ("📎 <i>Older alert: CA read from the alert message; claim facts "
+                         + ("from GitClaim's own log." if f is not None and (f.github_login or f.claim_sol) else "unavailable (not verified).")
+                         + "</i>\n"),
+}
+
+
+def _explicit_target(p) -> bool:
+    """An explicit argument always beats reply context (/gh also accepts a login or owner/repo)."""
+    if p.name == "github":
+        return bool(p.args)
+    return any(dd.is_mint(a) for a in p.args) or bool(p.args)
+
+
+def _choices_text(name: str, mints) -> str:
+    alias = {"research": "re", "holders": "ho", "github": "gh", "liquidity": "liq"}.get(name, name)
+    rows = "\n".join(f"• <code>/{alias} {E(m)}</code>" for m in list(mints)[:8])
+    return f"🤔 That alert lists {len(mints)} tokens. Which one?\n{rows}"
+
+
+def facts_from_meta(meta: dict | None, mint: str):
+    """ClaimFacts from the metadata GitClaim stored when it SENT the alert (verified at send time)."""
+    from research.prompt import ClaimFacts
+    f = dict((meta or {}).get("facts") or {})
+    if not f or f.get("mint") != mint:
+        return None
+    allowed = set(ClaimFacts.__dataclass_fields__)
+    f = {k: v for k, v in f.items() if k in allowed}
+    for k in ("signer_tags", "claimant_wallets"):
+        if k in f:
+            f[k] = tuple(f[k] or ())
+    try:
+        return ClaimFacts(**f)
+    except TypeError:
+        return None

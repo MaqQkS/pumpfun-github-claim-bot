@@ -618,7 +618,11 @@ class TestAlertsUnchanged(unittest.TestCase):
         self.assertEqual(len(outs[0][1]), 6)    # 3 alerts x 2 subscribers, HTML parse mode
         self.assertTrue(all(j["parse_mode"] == "HTML" for _, j in outs[0][1]))
         import inspect
-        self.assertEqual(inspect.getsource(self.old.tg_send_all), inspect.getsource(bot.tg_send_all))
+        # Phase 4 only adds message_id capture lines (_remember_alert) and an optional meta arg; delivery code is otherwise identical
+        def strip4(src):
+            src = src.replace("def tg_send_all(text, meta=None):", "def tg_send_all(text):")
+            return "\n".join(l for l in src.splitlines() if "_remember_alert" not in l)
+        self.assertEqual(strip4(inspect.getsource(self.old.tg_send_all)), strip4(inspect.getsource(bot.tg_send_all)))
         self.assertEqual(inspect.getsource(self.old.format_alert), inspect.getsource(bot.format_alert))
 
 
