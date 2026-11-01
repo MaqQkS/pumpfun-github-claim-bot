@@ -388,9 +388,17 @@ class CommandService:
             facts = self.ctx.facts_for(job.mint)
         except Exception:
             facts = None
+        import project_context as pc
+        pctx = None
+        try:                                                        # free reads, inside the single research slot
+            pctx = pc.gather(job.mint, getattr(facts, "github_login", None), http=self.http,
+                             rpc_url=self.rpc_url)
+            log.info("re context ok=%s failed=%s", ",".join(pctx["sources_ok"]), ",".join(pctx["sources_failed"]))
+        except Exception as e:
+            log.warning("re context failed: %s", type(e).__name__)
         self.llm_calls += 1
-        res = self.adapter().research(f"re {job.mint}", facts)      # never raises; budget + Queen checks inside
-        return format_research(job.mint, res, facts)
+        res = self.adapter().research(f"re {job.mint}", facts, pc.context_block(pctx) if pctx else None)
+        return format_research(job.mint, res, facts, pctx)
 
     # ---- direct handlers (no LLM) ------------------------------------------
     def _mint_arg(self, args):
@@ -425,7 +433,7 @@ class CommandService:
         if dd.is_mint(a) and "/" not in a and (len(a) >= 32):
             ids = list(dict.fromkeys(self.ctx.github_ids_for(a) or []))
             if not ids:
-                return f"No GitHub account is linked to a fee claim GitClaim has seen for <code>{E(a)}</code>."
+                return f"🐙 No linked GitHub claim found for <code>{E(_short(a))}</code> (GitClaim has not seen a GitHub fee claim on this coin). Try <code>/re {E(a)}</code> for its narrative."
             blocks = [format_github(dd.github_user(uid=i, http=self.http)) for i in ids[:3]]
             return f"🐙 GitHub linked to fee claims on <code>{E(_short(a))}</code>\n\n" + "\n\n".join(blocks)
         m = dd.GH_REPO_RE.match(a)
@@ -546,7 +554,7 @@ def _split_answer(text: str) -> dict:
     return out
 
 
-def format_research(mint: str, res, facts=None) -> str:
+def format_research(mint: str, res, facts=None, pctx=None) -> str:
     from research.formatter import preserve_addresses, sanitize_urls
     if not res.ok:
         msg = {"budget": "💸 ", "queen_unavailable": "⚪ "}.get(res.error or "", "⚠️ ")
@@ -565,10 +573,12 @@ def format_research(mint: str, res, facts=None) -> str:
     sym = (facts.symbol if facts is not None and facts.symbol else None)
     flags = " · cached" if res.cached else ""
     L = [f"🔎 <b>{E(sym) if sym else 'Research'}</b> · <code>{E(_short(mint))}</code>{flags}", "",
-         "🧠 <b>AI take</b> <i>(interpretation)</i>", E(narrative[:700] or "No narrative returned.")]
+         "🧠 <b>AI take</b> <i>(interpretation)</i>", E(narrative if len(narrative) <= 450 else narrative[:447].rsplit(" ", 1)[0] + "…") if narrative else "No narrative returned."]
     if verdict:
         L.append(f"⚠️ {E(verdict[:240])}")
-    if facts is not None and (facts.github_login or facts.claim_sol):
+    if facts is None or not (facts.github_login or facts.claim_sol):
+        L += ["", "✅ No GitHub claim seen by GitClaim"]
+    else:
         L += ["", "✅ <b>GitClaim facts</b>"]
         who = facts.github_login or "?"
         L.append(f"🐙 {E(who)}" + (f" ({E(facts.github_display)})" if facts.github_display else "")
@@ -578,9 +588,11 @@ def format_research(mint: str, res, facts=None) -> str:
             tags = " · " + " · ".join(E(t) for t in facts.signer_tags) if facts.signer_tags else ""
             L.append(f"💸 {facts.claim_sol:.2f} SOL{part} · {E(facts.claim_kind or 'claim')}{tags}")
     if data:
-        L += ["", "📊 <b>Key data</b> <i>(Queen's tools, not re-verified)</i>"] + [f"• {E(x if len(x) <= 160 else x[:157].rsplit(' ', 1)[0] + '…')}" for x in data[:7]]
+        L += ["", "📊 <b>Key data</b> <i>(Queen's tools, not re-verified)</i>"] + [f"• {E(x if len(x) <= 160 else x[:157].rsplit(' ', 1)[0] + '…')}" for x in data[:5]]
     links = [f'<a href="https://solscan.io/token/{E(mint)}">Solscan</a>', f'<a href="https://rugcheck.xyz/tokens/{E(mint)}">RugCheck</a>',
              f'<a href="https://dexscreener.com/solana/{E(mint)}">DexScreener</a>']
+    for lab, u in ((pctx or {}).get("links") or [])[:3]:          # structured URLs only, original case
+        links.append(f'<a href="{E(u)}">{E(lab)}</a>')
     if facts is not None and facts.tx_signature:
         links.append(f'<a href="https://solscan.io/tx/{E(facts.tx_signature)}">Claim tx</a>')
     L += ["", "🔗 " + " · ".join(links)]

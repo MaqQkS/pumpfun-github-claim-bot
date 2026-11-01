@@ -54,13 +54,13 @@ class ResearchAdapter:
         return out
 
     # ---- public entry -------------------------------------------------------------------------
-    def research(self, command_text: str, facts: ClaimFacts | None = None) -> ResearchResult:
+    def research(self, command_text: str, facts: ClaimFacts | None = None, context: str | None = None) -> ResearchResult:
         try:
-            return self._research(command_text, facts)
+            return self._research(command_text, facts, context)
         except Exception as e:  # last line of defense: never propagate into the caller
             return ResearchResult(False, None, "Research failed unexpectedly.", f"internal:{type(e).__name__}")
 
-    def _research(self, text: str, facts: ClaimFacts | None) -> ResearchResult:
+    def _research(self, text: str, facts: ClaimFacts | None, context: str | None = None) -> ResearchResult:
         plan = route(text, self.s)
         if plan.error:
             msg = {"unavailable": plan.note, "deep_disabled": plan.note, "missing_mint": "Send a token mint (CA).",
@@ -88,7 +88,7 @@ class ResearchAdapter:
             r = fut.result()
             return ResearchResult(**{**r.__dict__, "deduped": True})
         try:
-            r = self._run(plan, facts)
+            r = self._run(plan, facts, context)
             if r.ok:
                 with self._lock:
                     self._cache[key] = (time.time() + self.s.cache_ttl_s, r)
@@ -102,7 +102,7 @@ class ResearchAdapter:
             with self._lock:
                 self._inflight.pop(key, None)
 
-    def _run(self, plan: RoutePlan, facts: ClaimFacts) -> ResearchResult:
+    def _run(self, plan: RoutePlan, facts: ClaimFacts, context: str | None = None) -> ResearchResult:
         from .formatter import format_result
         mode = "deep" if plan.deep else "standard"
         if not self._gate.acquire(timeout=1.0):
@@ -113,7 +113,8 @@ class ResearchAdapter:
             if row is None:
                 return ResearchResult(False, plan, f"Research paused: budget limit reached ({dec.reason}).", "budget")
             task = COMMANDS[plan.command].task
-            question = build_question(task, facts, COMMANDS[plan.command].limited, COMMANDS[plan.command].answer_format)
+            question = build_question(task, facts, COMMANDS[plan.command].limited, COMMANDS[plan.command].answer_format,
+                                      context=context)
             mark = self.meter.mark()
             t0 = time.time()
             try:

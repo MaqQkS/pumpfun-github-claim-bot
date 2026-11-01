@@ -102,7 +102,7 @@ class FakeAdapter:
     def __init__(self, result=None, gate=None):
         self.calls, self.result, self.gate = [], result, gate
 
-    def research(self, text, facts=None):
+    def research(self, text, facts=None, context=None):
         self.calls.append((text, facts))
         if self.gate:
             self.gate.wait(10)
@@ -390,7 +390,7 @@ class TestResearch(unittest.TestCase):
         lock = threading.Lock()
 
         class Slow(FakeAdapter):
-            def research(self, text, facts=None):
+            def research(self, text, facts=None, context=None):
                 with lock:
                     active[0] += 1; peak[0] = max(peak[0], active[0])
                 time.sleep(0.1)
