@@ -46,10 +46,10 @@ Ledger `day` = UTC date (`utc_day()`). The daily caps (3 runs, $0.15, 1000 credi
 ## Kill switch (seconds)
 Set `AUTO_RESEARCH_ENABLED=false` (or remove the lines) in `research/research.env`, then `./start.sh` (bot only, Queen untouched).
 Queued auto jobs are not run after the restart (they expire). Alerts keep flowing.
-Emergency without a restart: stop Queen (`research/queen/queen_down.sh`). Auto jobs then fail fast with no xAI cost, and alerts are unaffected.
+Emergency without a restart: stop Queen (`research/queen/queen_up.sh stop`). Auto jobs then fail fast with no xAI cost, and alerts are unaffected.
 
 ## Rollback
 - Config-only: the kill switch above.
-- Code: `git -C ~/pumpfun-github-claim-bot reset --hard a0375f5` is NOT used (it destroys history). Instead `git checkout a0375f5 -- .`
+- Code: Use `git revert` (no reset or force-push). For example `git checkout a0375f5 -- .`
   on a revert commit, or `git revert <phase6-fixes commits>`, then `./start.sh`. The ledger, alert_map and auto_jobs sqlite files are
   forward-compatible and can stay.
