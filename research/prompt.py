@@ -47,9 +47,25 @@ RULES = (
 )
 
 
-def build_question(task: str, facts: ClaimFacts, limited: str | None = None) -> str:
+ANSWER_FORMATS = {
+    "research": (
+        "Answer format (plain text, short, exactly these headers, no markdown tables, no source list, no JSON card):\n"
+        "NARRATIVE: 2-3 sentences: what the coin is about, what the GitHub-linked claimant appears to build, the meme/story. "
+        "Base it only on evidence you actually read (token name/metadata, website, the claimant's GitHub repos). If that "
+        "evidence is thin or missing, say plainly 'Narrative unclear:' and why. Never invent a story.\n"
+        "VERDICT: one sentence risk verdict (low / medium / high risk and the main reason).\n"
+        "DATA: up to 7 bullet lines starting with '- ', each 'label: value', from tool reads only, e.g.\n"
+        "- holders: top10 X% | largest Y% | pools Z%\n- liquidity: $X (pool type)\n- insiders: N flagged (RugCheck)\n"
+        "- authorities: mint revoked/active, freeze revoked/active\n- lp: X% locked/burned\n- sell impact: $1k -X%, $5k -Y%\n"
+        "Write 'n/a' for anything you could not read. Copy addresses exactly; do not list wallet addresses in DATA."
+    ),
+}
+
+
+def build_question(task: str, facts: ClaimFacts, limited: str | None = None, answer_format: str | None = None) -> str:
     # escape angle brackets so untrusted text cannot close the data block
     data = json.dumps(facts.as_data(), ensure_ascii=False, indent=1).replace("<", "\\u003c").replace(">", "\\u003e")
     lim = f"Note: {limited}\n" if limited else ""
-    return (f"{task}\nToken mint: {facts.mint}\n{lim}\n{RULES}\n"
+    fmt = f"\n{ANSWER_FORMATS[answer_format]}\n" if answer_format in ANSWER_FORMATS else ""
+    return (f"{task}\nToken mint: {facts.mint}\n{lim}\n{RULES}{fmt}\n"
             f"<gitclaim_verified_facts>\n{data}\n</gitclaim_verified_facts>")

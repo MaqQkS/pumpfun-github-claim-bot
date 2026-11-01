@@ -106,8 +106,8 @@ class FakeAdapter:
         self.calls.append((text, facts))
         if self.gate:
             self.gate.wait(10)
-        return self.result or ResearchResult(True, None, "A. Verified GitClaim facts\n- Mint: " + text.split()[-1] +
-                                             "\n\nC. AI interpretation (grok-4.3)\nok & <fine>", usage={"actual_usd": 0.02})
+        return self.result or ResearchResult(True, None, "NARRATIVE: ok & <fine>\nVERDICT: low risk\nDATA:\n- holders: top10 13%",
+                                             usage={"actual_usd": 0.02})
 
 
 def svc(enabled=True, adapter=None, http=None, max_queue=3, **cfg):
@@ -261,11 +261,12 @@ class TestAccess(unittest.TestCase):
     def test_replies_never_broadcast(self):
         bot.state["subscribers"] = [BALA, GROUP, 42]
         posted = []
-        bot.requests = types.SimpleNamespace(post=lambda url, json=None, **k: posted.append(json) or Resp(200, {}), exceptions=bot.requests.exceptions)
+        orig = bot._tg_session
+        bot._tg_session = lambda: types.SimpleNamespace(post=lambda url, json=None, **k: posted.append(json) or Resp(200, {}))
         try:
             bot.tg_reply_html(GROUP, "x")
         finally:
-            import requests as _r; bot.requests = _r
+            bot._tg_session = orig
         self.assertEqual([p["chat_id"] for p in posted], [GROUP])
 
 
@@ -325,8 +326,10 @@ class TestCommands(unittest.TestCase):
         dd._cache.clear()
         s, sent = self.go(f"/liq {FFM}")
         t = sent[0][1]
-        self.assertIn(f"<code>{FFM}</code>", t)
-        self.assertIn("$2.5k", t)
+        self.assertIn("<code>9r33…AUnZ</code>", t)
+        self.assertTrue(t.startswith("💧 <b>$FFM</b> liquidity: <b>$2.5k</b> (6.3 SOL) on PumpSwap"), t)
+        self.assertNotIn("Price", t); self.assertNotIn("FDV", t)
+        self.assertLessEqual(len(t.split("\n")), 4)
         self.assertIn("https://dexscreener.com/solana/Hs9GZ2oVJjS1PEXqVWEKwUsPuNNH2vcN8z1BqTyNbmGu", t)
 
     def test_holders_output_labels_pool(self):
@@ -334,8 +337,8 @@ class TestCommands(unittest.TestCase):
         s, sent = self.go(f"/ho {FFM}", http=holder_http())
         t = sent[0][1]
         self.assertIn("PumpSwap pool", t)
-        self.assertIn("Pool / curve: 15.0%", t)
-        self.assertIn("Top 10 wallets: 12.6%", t)   # 28+20+15+12+11+10+9+8+7+6 = 126M / 1B
+        self.assertIn("Pool / curve 15.0%", t)
+        self.assertIn("Top 10 wallets 12.6%", t)   # 28+20+15+12+11+10+9+8+7+6 = 126M / 1B
 
     def test_bad_ca(self):
         s, sent = self.go("/liq notamint")
@@ -361,7 +364,7 @@ class TestResearch(unittest.TestCase):
         self.assertIn("Researching", sent[0][1])
         self.assertEqual(ad.calls[0][0], f"re {FFM}")
         self.assertIn("&amp; &lt;fine&gt;", sent[1][1])       # escaped for HTML parse mode
-        self.assertIn("<b>A. Verified GitClaim facts</b>", sent[1][1])
+        self.assertIn("🧠 <b>AI take</b>", sent[1][1])
         self.assertEqual(s.llm_calls, 1)
 
     def test_queue_positions_and_overflow(self):
@@ -431,18 +434,48 @@ class TestResearch(unittest.TestCase):
         s.handle(GROUP, BALA, P(f"/re {FFM}"))
         self.assertTrue(wait_for(lambda: any("failed" in t for _, t in sent)))
 
+    def test_research_layout(self):
+        facts = ClaimFacts(mint=FFM, symbol="$FFM", github_login="NubsCarson", github_display="nubs", claim_sol=5.52,
+                           claim_total_sol=5.75, claim_coins=2, claim_kind="FIRST claim ever", tx_signature=SIG,
+                           signer_tags=("automated signer",))
+        ans = QueenAnswer(answer=("NARRATIVE: FFM is a meme coin; the claimant builds IQ inscription forks.\n"
+                                  "VERDICT: High risk: $2.5k liquidity and 14 insiders.\nDATA:\n- holders: top10 13.2% | largest 2.8% | pools 85.5%\n"
+                                  f"- liquidity: $2.5k https://dexscreener.com/solana/{FFM.lower()}\n- pair https://dexscreener.com/solana/abcdefghijkmnopqrstuvwxyz123456789\n"
+                                  "```token\n{\"a\":1}\n```"), tools=["token_pairs"], sources=["https://x.invalid/abcdefghijkmnopqrstuvwxyz123456789"], incomplete=[])
+        plan = RoutePlan("research", 1, True, model="grok-4.3", effort="low", mint=FFM)
+        r = ResearchResult(True, plan, "ignored", usage={"actual_usd": 0.0212}, latency_ms=22600, answer=ans)
+        t = tc.format_research(FFM, r, facts)
+        order = [t.index(x) for x in ("🧠 <b>AI take", "✅ <b>GitClaim facts", "📊 <b>Key data", "🔗 ", "🤖 grok-4.3")]
+        self.assertEqual(order, sorted(order))
+        self.assertLess(len(t), 1500)
+        self.assertIn("High risk", t); self.assertIn("5.52 SOL of 5.75 across 2 coins", t)
+        self.assertIn(f"https://dexscreener.com/solana/{FFM}", t); self.assertNotIn(FFM.lower(), t)
+        self.assertNotIn("abcdefghijkmnop", t); self.assertIn("link omitted", t)
+        self.assertIn(f"https://solscan.io/tx/{SIG}", t)
+        self.assertNotIn("token_pairs", t); self.assertNotIn("&quot;a&quot;", t)
+        self.assertIn("$0.0212", t); self.assertIn("22.6s", t)
+
+    def test_research_prompt_asks_for_narrative(self):
+        from research.config import COMMANDS
+        from research.prompt import build_question
+        c = COMMANDS["research"]
+        q = build_question(c.task, ClaimFacts(mint=FFM), c.limited, c.answer_format)
+        for k in ("NARRATIVE:", "VERDICT:", "DATA:", "Narrative unclear", "Never invent", "github_repo"):
+            self.assertIn(k, q)
+        self.assertNotIn("NARRATIVE:", build_question(COMMANDS["developer"].task, ClaimFacts(mint=FFM)))
+
     def test_token_card_json_stripped(self):
         r = ResearchResult(True, None, 'C. AI\nsummary\n\n```token\n{"a":1}\n```\n\nLimitations\n- none')
         t = tc.format_research(FFM, r)
         self.assertNotIn('"a"', t); self.assertNotIn("&quot;a&quot;", t); self.assertIn("summary", t); self.assertIn("Limitations", t)
 
     def test_long_reply_split(self):
-        long = "\n".join(f"line {i} " + "x" * 80 for i in range(200))
-        s, sent = svc(adapter=FakeAdapter(ResearchResult(True, None, long)))
-        s.handle(GROUP, BALA, P(f"/re {FFM}"))
-        self.assertTrue(wait_for(lambda: len(sent) >= 4))
-        self.assertTrue(all(len(t) <= tc.TG_LIMIT for _, t in sent))
-        self.assertTrue(all("<b>" not in t or "</b>" in t for _, t in sent))
+        long = "\n".join(f"<b>line {i}</b> " + "x" * 80 for i in range(200))
+        parts = tc.split_message(long)
+        self.assertGreaterEqual(len(parts), 4)
+        self.assertTrue(all(len(t) <= tc.TG_LIMIT for t in parts))
+        self.assertTrue(all(t.count("<b>") == t.count("</b>") for t in parts))
+        self.assertEqual("\n".join(parts), long)
 
     def test_real_adapter_budget_exhausted_no_call(self):
         """Real Phase 2 adapter with a $0 budget: refused before Queen is contacted."""
@@ -486,7 +519,7 @@ class TestNonBlocking(unittest.TestCase):
         finally:
             bot.requests = real
             gate.set()
-        self.assertTrue(wait_for(lambda: any("Research" in t and "<b>A." in t for _, t in sent)))
+        self.assertTrue(wait_for(lambda: any("AI take" in t for _, t in sent)))
 
 
 class TestUrlAndCase(unittest.TestCase):
@@ -529,8 +562,8 @@ class TestUrlAndCase(unittest.TestCase):
         s, sent = svc()
         s.handle(GROUP, BALA, P(f"/liq {FFM}"))
         self.assertTrue(wait_for(lambda: sent))
-        self.assertIn(FFM, sent[0][1])
-        self.assertNotIn(FFM.lower(), sent[0][1])
+        self.assertIn("9r33…AUnZ", sent[0][1])
+        self.assertNotIn(FFM.lower()[:4], sent[0][1].replace("9r33", ""))
         self.assertFalse(dd.is_mint(FFM.lower().replace("l", "L")[:31]))
         self.assertFalse(dd.is_mint("0" * 40))
 
@@ -587,6 +620,36 @@ class TestAlertsUnchanged(unittest.TestCase):
         import inspect
         self.assertEqual(inspect.getsource(self.old.tg_send_all), inspect.getsource(bot.tg_send_all))
         self.assertEqual(inspect.getsource(self.old.format_alert), inspect.getsource(bot.format_alert))
+
+
+class TestLogging(unittest.TestCase):
+    def test_token_redacted_from_logs_and_exceptions(self):
+        import io, logging
+        buf = io.StringIO(); h = logging.StreamHandler(buf); h.addFilter(bot.REDACT)
+        lg = logging.getLogger("redact-test"); lg.addHandler(h); lg.propagate = False
+        tok = os.environ["TELEGRAM_BOT_TOKEN"]
+        lg.warning("tg poll: HTTPSConnectionPool(host='api.telegram.org'): url: /bot%s/getUpdates?offset=1", tok)
+        try:
+            raise IOError(f"https://api.telegram.org/bot{tok}/sendMessage failed; key {os.environ['HELIUS_API_KEY']}")
+        except IOError:
+            lg.exception("send failed")
+        out = buf.getvalue()
+        self.assertNotIn(tok, out); self.assertNotIn(os.environ["HELIUS_API_KEY"], out)
+        self.assertGreaterEqual(out.count("<redacted>"), 3)
+
+    def test_ipv4_forced_and_poll_timeouts(self):
+        import socket, urllib3.util.connection as c
+        self.assertEqual(c.allowed_gai_family(), socket.AF_INET)
+        src = (REPO / "bot.py").read_text()
+        self.assertIn("timeout=(5, 35)", src); self.assertIn("sess.get(", src)
+
+    def test_command_timing_logged(self):
+        s, sent = svc()
+        with self.assertLogs("bot.cmds", "INFO") as cm:
+            s.handle(GROUP, BALA, P("/h"), time.time())
+            self.assertTrue(wait_for(lambda: sent))
+            time.sleep(0.05)
+        self.assertTrue(any(re.search(r"cmd /help .*recv->reply \d+ms", m) for m in cm.output))
 
 
 class TestSecrets(unittest.TestCase):

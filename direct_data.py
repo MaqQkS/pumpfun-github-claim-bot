@@ -64,7 +64,7 @@ def money(v) -> str:
 def dex_pairs(mint: str, http=requests):
     def fetch():
         CALLS["dexscreener"] += 1
-        r = http.get(f"https://api.dexscreener.com/tokens/v1/solana/{mint}", timeout=10)
+        r = http.get(f"https://api.dexscreener.com/tokens/v1/solana/{mint}", timeout=6)
         if not r.ok:
             return None
         j = r.json()
@@ -112,7 +112,7 @@ def queen_rpc_url() -> str | None:
 
 def _rpc(url, method, params, http=requests):
     CALLS["helius:" + method] += 1
-    r = http.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=15)
+    r = http.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=8)
     if not r.ok:
         raise IOError(f"HTTP {r.status_code}")
     j = r.json()
@@ -159,7 +159,7 @@ def holders(mint: str, http=requests, rpc_url: str | None = None, pool_hint: str
 def _gh(path, http=requests):
     def fetch():
         CALLS["github"] += 1
-        r = http.get("https://api.github.com" + path, timeout=10, headers={"Accept": "application/vnd.github+json"})
+        r = http.get("https://api.github.com" + path, timeout=6, headers={"Accept": "application/vnd.github+json"})
         if r.status_code == 404:
             return {"_missing": True}
         if not r.ok:

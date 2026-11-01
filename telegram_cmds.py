@@ -234,7 +234,7 @@ class CommandService:
         return self.cfg.enabled and chat_id in self.cfg.chats and user_id in self.cfg.testers
 
     # entry point from the poll thread: must not block -----------------------
-    def handle(self, chat_id: int, user_id: int | None, p: Parsed) -> bool:
+    def handle(self, chat_id: int, user_id: int | None, p: Parsed, t_recv: float | None = None) -> bool:
         """Returns True when the command was accepted (reply will follow), False when ignored."""
         if not self.allowed(chat_id, user_id):
             log.info("cmd /%s ignored (chat=%s user=%s not allowlisted or commands disabled)", p.name, chat_id, user_id)
@@ -246,6 +246,7 @@ class CommandService:
                 return False
             self._inflight.add(key)
         try:
+            self._t_recv = t_recv or time.time()
             return self._dispatch(chat_id, p, key)
         except Exception:
             self._done(key)
@@ -288,6 +289,7 @@ class CommandService:
         return True
 
     def _submit_direct(self, key, fn, chat, track=False):
+        t_recv, name = getattr(self, "_t_recv", time.time()), key[1]
         with self._lock:
             if self._direct_pending >= 10:
                 if track: self._inflight.discard(key)
@@ -300,7 +302,12 @@ class CommandService:
 
         def run():
             try:
-                self._reply(chat, fn())
+                t0 = time.time()
+                out = fn()
+                t1 = time.time()
+                self._reply(chat, out)
+                log.info("cmd /%s chat=%s recv->reply %dms (handler %dms, send %dms)", name, chat,
+                         (time.time() - t_recv) * 1000, (t1 - t0) * 1000, (time.time() - t1) * 1000)
             except Exception as e:
                 log.exception("cmd failed: %s", e)
                 self._reply(chat, "⚠️ Command failed. Alerts are unaffected.")
@@ -318,6 +325,7 @@ class CommandService:
             self._submit_direct(key, lambda: "Send a CA: <code>/re &lt;CA&gt;</code> (base58, 32–44 chars). Reply-to-alert comes later.", chat)
             return True
         job = _Job(chat, mint, key)
+        job.enqueued = getattr(self, "_t_recv", time.time())
         with self._lock:
             busy = self._running is not None
             try:
@@ -362,6 +370,7 @@ class CommandService:
                     log.exception("research job failed: %s", e)
                     out = "⚠️ Research failed. Alerts are unaffected."
                 self._out.submit(self._reply, job.chat, out).result(timeout=120)
+                log.info("cmd /research chat=%s recv->reply %dms", job.chat, (time.time() - job.enqueued) * 1000)
             except Exception as e:
                 log.warning("research reply failed: %s", str(e)[:120])
             finally:
@@ -381,7 +390,7 @@ class CommandService:
             facts = None
         self.llm_calls += 1
         res = self.adapter().research(f"re {job.mint}", facts)      # never raises; budget + Queen checks inside
-        return format_research(job.mint, res)
+        return format_research(job.mint, res, facts)
 
     # ---- direct handlers (no LLM) ------------------------------------------
     def _mint_arg(self, args):
@@ -418,7 +427,7 @@ class CommandService:
             if not ids:
                 return f"No GitHub account is linked to a fee claim GitClaim has seen for <code>{E(a)}</code>."
             blocks = [format_github(dd.github_user(uid=i, http=self.http)) for i in ids[:3]]
-            return f"🐙 GitHub linked to fee claims on <code>{E(a)}</code>\n\n" + "\n\n".join(blocks)
+            return f"🐙 GitHub linked to fee claims on <code>{E(_short(a))}</code>\n\n" + "\n\n".join(blocks)
         m = dd.GH_REPO_RE.match(a)
         if m:
             return format_github(dd.github_repo(m.group(1), m.group(2), http=self.http))
@@ -434,33 +443,26 @@ class CommandService:
             pass
         L = ["📡 <b>GitClaim status</b>"]
         ws = st.get("ws_connected")
-        L.append(f"• Scanner: {'🟢 websocket connected' if ws else '🔴 websocket down'}" if ws is not None else "• Scanner: n/a")
-        if st.get("last_ws_msg"):
-            L.append(f"• Last stream event: {int(time.time() - st['last_ws_msg'])}s ago")
-        if st.get("last_alert"):
-            L.append(f"• Last alert: {_utc(st['last_alert'])}")
+        last = f" · last event {int(time.time() - st['last_ws_msg'])}s ago" if st.get("last_ws_msg") else ""
+        L.append(("🟢 Scanner live" if ws else "🔴 Scanner websocket down") + last if ws is not None else "⚪ Scanner: n/a")
         if "subscribers" in st:
-            L.append(f"• Subscribers: {st['subscribers']}")
-        if st.get("helius_calls") is not None:
-            L.append(f"• Scanner Helius calls since start: {st['helius_calls']:,}")
+            L.append(f"👥 Subscribers: {st['subscribers']}")
         q = self.queue_state()
         try:
             from research.client import QueenClient
             from research.config import load_settings
             from research.ledger import Ledger
             s = load_settings()
-            up = QueenClient(s.standard_url).health()
-            L.append(f"• Queen (grok-4.3): {'🟢 online' if up else '⚪ offline (start on demand)'} · deep: off")
+            up = QueenClient(s.standard_url).health(timeout_s=1.0)
+            L.append(f"🧠 Queen (grok-4.3): {'🟢 online' if up else '⚪ offline'} · deep off")
             lg = Ledger(s.ledger_path)
             t = lg.totals(); lg.close()
-            L.append(f"• AI budget: ${max(0, s.budget_daily_usd - t['usd_today']):.2f} left today · "
-                     f"${max(0, s.budget_total_usd - t['usd_total']):.2f} left total (local ledger)")
-            L.append(f"• Queen Helius: ~{int(t['helius_today'])} credits today / {s.helius_daily_credits:,} cap (estimate)")
+            L.append(f"💸 AI budget: ${max(0, s.budget_daily_usd - t['usd_today']):.2f} today · "
+                     f"${max(0, s.budget_total_usd - t['usd_total']):.2f} total (local ledger)")
+            L.append(f"⛽ Queen Helius: ~{int(t['helius_today'])}/{s.helius_daily_credits:,} today (est.)")
         except Exception as e:
-            L.append(f"• Queen/ledger: n/a ({type(e).__name__})")
-        L.append(f"• Research queue: {'1 running' if q['running'] else 'idle'}, {q['waiting']}/{q['max']} waiting")
-        direct = sum(v for k, v in dd.CALLS.items() if k.startswith("helius:"))
-        L.append(f"• Command Helius calls (Queen key): {direct}")
+            L.append(f"⚠️ Queen/ledger: n/a ({type(e).__name__})")
+        L.append(f"⏳ Research queue: {'1 running' if q['running'] else 'idle'}, {q['waiting']}/{q['max']} waiting")
         return "\n".join(L)
 
 
@@ -471,26 +473,21 @@ def _default_adapter():
 
 # ---- output formatters (pure; used by tests and examples) --------------------------------------
 def _tx_ts(ts):
-    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%H:%M UTC")
 
 
 def format_liquidity(mint: str, d: dict) -> str:
     if not d.get("ok"):
         return f"⚠️ Liquidity unavailable: {E(d.get('error', 'error'))}"
     if not d.get("pairs"):
-        return f"💧 No DexScreener pairs for <code>{E(mint)}</code> yet (still on the bonding curve or not indexed)."
-    sym = E(str(d.get("symbol") or "?"))
-    L = [f"💧 <b>${sym}</b> liquidity", f"<code>{E(mint)}</code>", "",
-         f"• Price: ${E(str(d.get('price_usd') or 'n/a'))} · 24h {d['chg24']:+.1f}%" if d.get("chg24") is not None else f"• Price: ${E(str(d.get('price_usd') or 'n/a'))}",
-         f"• MC: {dd.money(d.get('mc'))} · FDV: {dd.money(d.get('fdv'))}",
-         f"• Liquidity: {dd.money(d.get('liq_usd'))} on {E(str(d.get('dex')))}" +
-         (f" ({d['liq_quote']:,.1f} {E(str(d.get('quote')))})" if d.get("liq_quote") else ""),
-         f"• Vol 24h: {dd.money(d.get('vol24'))}"]
-    if d["pairs"] > 1:
-        L.append(f"• {d['pairs']} pairs, total liquidity {dd.money(d.get('total_liq'))}")
-    if d.get("pair"):
-        L.append(f'🔗 <a href="https://dexscreener.com/solana/{E(d["pair"])}">DexScreener</a>')
-    L.append(f"Source: DexScreener API · {_tx_ts(d['fetched'])} · no AI")
+        return f"💧 No DexScreener pool for <code>{E(_short(mint))}</code> yet (bonding curve or not indexed)."
+    sol = f" ({d['liq_quote']:,.1f} {E(str(d.get('quote')))})" if d.get("liq_quote") else ""
+    dex = {"pumpswap": "PumpSwap", "raydium": "Raydium", "meteora": "Meteora", "orca": "Orca"}.get(str(d.get("dex")), str(d.get("dex")))
+    more = f" · {d['pairs']} pools, {dd.money(d.get('total_liq'))} total" if d["pairs"] > 1 else ""
+    L = [f"💧 <b>${E(str(d.get('symbol') or '?'))}</b> liquidity: <b>{dd.money(d.get('liq_usd'))}</b>{sol} on {E(dex)}{more}",
+         f"📈 MC {dd.money(d.get('mc'))} · Vol 24h {dd.money(d.get('vol24'))}"]
+    link = f'<a href="https://dexscreener.com/solana/{E(d["pair"])}">DexScreener</a> · ' if d.get("pair") else ""
+    L.append(f"🔗 {link}<code>{E(_short(mint))}</code>")
     return "\n".join(L)
 
 
@@ -498,14 +495,14 @@ def format_holders(mint: str, d: dict, lq: dict | None = None) -> str:
     if not d.get("ok"):
         return f"⚠️ Holders unavailable: {E(d.get('error', 'error'))}"
     sym = (lq or {}).get("symbol")
-    L = [f"👥 <b>{'$' + E(sym) if sym else 'Holders'}</b> top holders", f"<code>{E(mint)}</code>", "",
-         f"• Top 10 wallets: {_pct(d['top10_wallet_pct'])} · largest {_pct(d['largest_wallet_pct'])}",
-         f"• Pool / curve: {_pct(d['pool_pct'])}" if d["pool_pct"] else "• Pool / curve: none identified in top 20", ""]
+    L = [f"👥 <b>{'$' + E(sym) if sym else 'Holders'}</b> top holders · <code>{E(_short(mint))}</code>",
+         f"📊 Top 10 wallets {_pct(d['top10_wallet_pct'])} · largest {_pct(d['largest_wallet_pct'])}",
+         f"🏊 Pool / curve {_pct(d['pool_pct'])}" if d["pool_pct"] else "🏊 Pool / curve: none in top 20", ""]
     for i, r in enumerate(d["rows"][:10], 1):
         o = r["owner"] or r["account"]
         tag = f" · {E(r['label'])}" if r["label"] else ""
         L.append(f'{i}. <a href="https://solscan.io/account/{E(o)}">{E(_short(o))}</a> {_pct(r["pct"])}{tag}')
-    L.append(f"Source: Helius RPC (getTokenLargestAccounts) · {_tx_ts(d['fetched'])} · no AI")
+    L.append(f"🔎 Helius RPC · {_tx_ts(d['fetched'])} · no AI")
     return "\n".join(L)
 
 
@@ -516,32 +513,89 @@ def format_github(d: dict) -> str:
         L = [f"📦 <b>{E(d['full_name'])}</b>" + (" (fork)" if d.get("fork") else "")]
         if d.get("description"):
             L.append(E(d["description"][:200]))
-        L += [f"• Created {E(d['created'][:10])} ({d['age']} old) · last push {E((d.get('pushed') or 'n/a')[:10])}",
-              f"• ⭐ {d['stars']} · forks {d['forks']} · {E(str(d.get('language') or 'n/a'))}",
-              f"• Commits: {d['commits'] if d['commits'] is not None else 'n/a'} · contributors: {d['contributors'] if d['contributors'] is not None else 'n/a'}",
-              f'🔗 <a href="{E(d["url"])}">GitHub</a> · Source: GitHub API · no AI']
+        L += [f"📅 Created {E(d['created'][:10])} ({d['age']} old) · last push {E((d.get('pushed') or 'n/a')[:10])}",
+              f"⭐ {d['stars']} · 🍴 {d['forks']} · {E(str(d.get('language') or 'n/a'))}",
+              f"🧾 Commits {d['commits'] if d['commits'] is not None else 'n/a'} · contributors {d['contributors'] if d['contributors'] is not None else 'n/a'}",
+              f'🔗 <a href="{E(d["url"])}">GitHub</a>']
         return "\n".join(L)
-    flag = " · ⚠️ new/empty acct" if (d.get("repos") or 0) == 0 or d["age"].endswith("d") and int(d["age"][:-1] or 0) < 180 else ""
-    L = [f"👤 <b>{E(d['login'])}</b>" + (f" ({E(d['name'])})" if d.get("name") else "") + (f" · {E(d['type'])}" if d.get("type") not in (None, "User") else ""),
-         f"• {d['followers']} followers · {d['repos']} repos · {d['age']} old (since {E((d.get('created') or '')[:10])}){flag}"]
-    for r in d.get("recent") or []:
-        L.append(f"• {E(r['name'])}{' (fork)' if r.get('fork') else ''} · pushed {E((r.get('pushed') or '')[:10])} · ⭐ {r.get('stars')}")
-    L.append(f'🔗 <a href="{E(d["url"])}">GitHub</a> · Source: GitHub API · no AI')
+    young = d["age"].endswith("d") and int(d["age"][:-1] or 0) < 180
+    flag = "\n⚠️ new or empty account" if (d.get("repos") or 0) == 0 or young else ""
+    L = [f"🐙 <b>{E(d['login'])}</b>" + (f" ({E(d['name'])})" if d.get("name") else "") + (f" · {E(d['type'])}" if d.get("type") not in (None, "User") else ""),
+         f"👤 {d['followers']} followers · {d['repos']} repos · {d['age']} old (since {E((d.get('created') or '')[:10])}){flag}"]
+    rec = d.get("recent") or []
+    if rec:
+        L.append("🛠 Recent: " + ", ".join(f"{E(r['name'].split('/', 1)[-1])}{' (fork)' if r.get('fork') else ''}" for r in rec)
+                 + f" · pushed {E((rec[0].get('pushed') or '')[:10])}")
+    L.append(f'🔗 <a href="{E(d["url"])}">GitHub</a>')
     return "\n".join(L)
 
 
-def format_research(mint: str, res) -> str:
+_SEC = re.compile(r"^\W*(NARRATIVE|VERDICT|DATA)\W*:?\s*(.*)$", re.I)
+
+
+def _split_answer(text: str) -> dict:
+    out, cur = {"NARRATIVE": [], "VERDICT": [], "DATA": [], "_pre": []}, "_pre"
+    for line in text.split("\n"):
+        m = _SEC.match(line)
+        if m and m.group(1).upper() in out:
+            cur = m.group(1).upper()
+            if m.group(2).strip():
+                out[cur].append(m.group(2).strip())
+        elif line.strip():
+            out[cur].append(line.strip())
+    return out
+
+
+def format_research(mint: str, res, facts=None) -> str:
+    from research.formatter import preserve_addresses, sanitize_urls
     if not res.ok:
         msg = {"budget": "💸 ", "queen_unavailable": "⚪ "}.get(res.error or "", "⚠️ ")
         extra = "\nQueen is offline; start it with research/queen/start_queen.sh standard." if res.error == "queen_unavailable" else ""
         return f"{msg}{E(res.text)}{extra}\n<code>{E(mint)}</code>"
-    flags = " (cached)" if res.cached else (" (shared with an identical request)" if res.deduped else "")
-    head = f"🔎 <b>Research</b>{flags}\n<code>{E(mint)}</code>\n"
-    body = []
-    text = re.sub(r"\n?```token\n.*?\n```\n?", "\n", res.text, flags=re.S)   # Queen UI card JSON: not for Telegram
-    for line in text.split("\n"):
-        esc = E(line)
-        if line[:3] in ("A. ", "B. ", "C. ") or line in ("Limitations",):
-            esc = f"<b>{esc}</b>"
-        body.append(esc)
-    return head + "\n" + "\n".join(body)
+    trusted = facts.addresses() if facts is not None else [mint]
+    raw = res.answer.answer if getattr(res, "answer", None) is not None else res.text
+    raw = re.sub(r"\n?```token\n.*?\n```\n?", "\n", raw, flags=re.S)
+    urep = sanitize_urls(raw, trusted)
+    arep = preserve_addresses(urep.text, trusted)
+    parts = _split_answer(arep.text)
+    narrative = " ".join(parts["NARRATIVE"]) or " ".join([x for x in parts["_pre"] if not x.startswith(("-", "•", "*"))][:3])
+    verdict = " ".join(parts["VERDICT"])
+    data = [x.lstrip("-•* ").strip() for x in parts["DATA"] if x.lstrip().startswith(("-", "•", "*"))] or \
+           [x.lstrip("-•* ").strip() for x in parts["_pre"] if x.lstrip().startswith(("-", "•"))]
+    sym = (facts.symbol if facts is not None and facts.symbol else None)
+    flags = " · cached" if res.cached else ""
+    L = [f"🔎 <b>{E(sym) if sym else 'Research'}</b> · <code>{E(_short(mint))}</code>{flags}", "",
+         "🧠 <b>AI take</b> <i>(interpretation)</i>", E(narrative[:700] or "No narrative returned.")]
+    if verdict:
+        L.append(f"⚠️ {E(verdict[:240])}")
+    if facts is not None and (facts.github_login or facts.claim_sol):
+        L += ["", "✅ <b>GitClaim facts</b>"]
+        who = facts.github_login or "?"
+        L.append(f"🐙 {E(who)}" + (f" ({E(facts.github_display)})" if facts.github_display else "")
+                 + (f" · {E(facts.github_profile)}" if facts.github_profile else ""))
+        if facts.claim_sol is not None:
+            part = f" of {facts.claim_total_sol:.2f} across {facts.claim_coins} coins" if (facts.claim_coins or 1) > 1 and facts.claim_total_sol else ""
+            tags = " · " + " · ".join(E(t) for t in facts.signer_tags) if facts.signer_tags else ""
+            L.append(f"💸 {facts.claim_sol:.2f} SOL{part} · {E(facts.claim_kind or 'claim')}{tags}")
+    if data:
+        L += ["", "📊 <b>Key data</b> <i>(Queen's tools, not re-verified)</i>"] + [f"• {E(x if len(x) <= 160 else x[:157].rsplit(' ', 1)[0] + '…')}" for x in data[:7]]
+    links = [f'<a href="https://solscan.io/token/{E(mint)}">Solscan</a>', f'<a href="https://rugcheck.xyz/tokens/{E(mint)}">RugCheck</a>',
+             f'<a href="https://dexscreener.com/solana/{E(mint)}">DexScreener</a>']
+    if facts is not None and facts.tx_signature:
+        links.append(f'<a href="https://solscan.io/tx/{E(facts.tx_signature)}">Claim tx</a>')
+    L += ["", "🔗 " + " · ".join(links)]
+    notes = []
+    if urep.dropped:
+        notes.append(f"{len(urep.dropped)} link omitted (unverified)")
+    if arep.unverified:
+        notes.append(f"{len(arep.unverified)} AI-only address unverified")
+    if notes:
+        L.append("ℹ️ " + " · ".join(notes))
+    u = res.usage or {}
+    meta = [f"🤖 {E(res.plan.model) if res.plan else 'grok-4.3'}"]
+    if u.get("actual_usd") is not None:
+        meta.append(f"${u['actual_usd']:.4f}")
+    if res.latency_ms:
+        meta.append(f"{res.latency_ms / 1000:.1f}s")
+    L.append(" · ".join(meta))
+    return "\n".join(L)

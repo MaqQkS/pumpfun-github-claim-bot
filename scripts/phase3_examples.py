@@ -26,17 +26,21 @@ ctx = tc.BotContext(lambda: {"ws_connected": None, "subscribers": len(state["sub
                     lambda m: facts, lambda m: ids)
 s = tc.CommandService(tc.CmdConfig(enabled=True), lambda c, t: None, ctx)
 
-def show(cmd, text):
-    print(f"===== {cmd} =====\n{text}\n")
+import time  # noqa: E402
 
-show("/h", s._cmd_help(()))
-show(f"/liq {mint}", s._cmd_liquidity((mint,)))
-show(f"/ho {mint}", s._cmd_holders((mint,)))
-show(f"/gh {mint}", s._cmd_github((mint,)))
+def show(cmd, fn):
+    t0 = time.time(); text = fn(); ms = (time.time() - t0) * 1000
+    print(f"===== {cmd}  [handler {ms:.0f}ms, {len(text)} chars] =====\n{text}\n")
+
+show("/h", lambda: s._cmd_help(()))
+show(f"/liq {mint}", lambda: s._cmd_liquidity((mint,)))
+show(f"/ho {mint}", lambda: s._cmd_holders((mint,)))
+show(f"/gh {mint}", lambda: s._cmd_github((mint,)))
 if login:
-    show(f"/gh {login}", s._cmd_github((login,)))
-show("/st  (offline: scanner fields n/a because this is not the running bot)", s._cmd_status(()))
-show(f"/d re {mint}", "🔬 Deep mode (grok-4.7) is disabled for now; no AI call was made. Use <code>/re &lt;CA&gt;</code> for standard research.")
+    show(f"/gh {login} ", lambda: s._cmd_github((login,)))
+show("/st  (offline: scanner fields n/a because this is not the running bot)", lambda: s._cmd_status(()))
+show(f"/liq {mint} (repeat, cached)", lambda: s._cmd_liquidity((mint,)))
+show(f"/d re {mint}", lambda: "🔬 Deep mode (grok-4.7) is disabled for now; no AI call was made. Use <code>/re &lt;CA&gt;</code> for standard research.")
 
 rec = json.loads((ROOT / "research/data/phase2-real-test.json").read_text())
 srcs = []
@@ -46,8 +50,8 @@ for line in (ROOT / "research/data/phase2-real-test.txt").read_text().splitlines
 ans = validate_answer({"answer": rec["raw_answer"], "tools": rec["tools"], "sources": srcs, "by": rec.get("by")})
 plan = RoutePlan("research", 1, True, model="grok-4.3", effort="low", mint=mint)
 text, rep = format_result(facts=facts, answer=ans, plan=plan, usage=rec["usage"], latency_ms=rec["latency_ms"])
-res = ResearchResult(True, plan, text, usage=rec["usage"])
+res = ResearchResult(True, plan, text, usage=rec["usage"], latency_ms=rec["latency_ms"], answer=ans)
 print(f"===== /re {mint}  (RECORDED Phase 2 Queen answer, re-formatted; no new AI call) =====")
 print(f"🔎 Researching <code>{mint}</code> with grok-4.3… usually 15–35s.\n---")
-for i, part in enumerate(tc.split_message(tc.format_research(mint, res))):
+for i, part in enumerate(tc.split_message(tc.format_research(mint, res, facts))):
     print(f"[message {i+1}, {len(part)} chars]\n{part}\n")

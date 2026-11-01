@@ -40,6 +40,7 @@ class Command:
     limited: str | None = None          # caveat shown with every answer
     unavailable: str | None = None      # reason, for TIER_UNAVAILABLE
     task: str = ""                      # what Queen is asked to do (Tier 1)
+    answer_format: str | None = None    # key into prompt.ANSWER_FORMATS
 
 
 COMMANDS: dict[str, Command] = {c.name: c for c in [
@@ -52,8 +53,11 @@ COMMANDS: dict[str, Command] = {c.name: c for c in [
     Command("github", ("gh",), TIER_DIRECT),
     # Tier 1: Queen on the standard model (grok-4.3, low reasoning)
     Command("research", ("re",), TIER_AI, deep_allowed=True,
-            task="Research this token: holder concentration and top wallets, liquidity, launch history, "
-                 "the fee claimant's on-chain activity, and risks."),
+            task="Research this token. First its narrative: what the coin/project is about, what the GitHub-linked "
+                 "fee claimant appears to be building (read their account/repos with github_repo), the meme or story, "
+                 "using the token's metadata and website (project_links / site_snapshot) when available. Then the key "
+                 "numbers: holder concentration, pools, liquidity, insiders, authorities, LP lock and sell impact.",
+            answer_format="research"),
     Command("developer", ("dev",), TIER_AI, deep_allowed=True,
             task="Investigate the developer side: the GitHub-linked fee claimant's on-chain activity, "
                  "other coins tied to the same wallets, and whether the GitHub identity looks authentic."),

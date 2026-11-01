@@ -113,7 +113,7 @@ class ResearchAdapter:
             if row is None:
                 return ResearchResult(False, plan, f"Research paused: budget limit reached ({dec.reason}).", "budget")
             task = COMMANDS[plan.command].task
-            question = build_question(task, facts, COMMANDS[plan.command].limited)
+            question = build_question(task, facts, COMMANDS[plan.command].limited, COMMANDS[plan.command].answer_format)
             mark = self.meter.mark()
             t0 = time.time()
             try:

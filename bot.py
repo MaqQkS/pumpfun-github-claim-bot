@@ -23,6 +23,31 @@ STATE = os.path.join(DIR, "state.json")
 log = logging.getLogger("bot")
 _lock = threading.Lock()
 
+class RedactSecrets(logging.Filter):
+    """Never let the Telegram token or Helius key reach a log line (exception text includes request URLs)."""
+    def __init__(self, secrets):
+        super().__init__(); self.secrets = [x for x in secrets if x and len(x) >= 8]
+    def scrub(self, text):
+        for x in self.secrets: text = text.replace(x, "<redacted>")
+        return text
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:
+            msg = str(record.msg)
+        record.msg, record.args = self.scrub(msg), None
+        if record.exc_info:
+            record.exc_text = self.scrub(logging.Formatter().formatException(record.exc_info)); record.exc_info = None
+        if record.exc_text: record.exc_text = self.scrub(record.exc_text)
+        return True
+REDACT = RedactSecrets([TG, HELIUS, os.environ.get("LOGS_WSS", "")])
+
+# This Mac's IPv6 route to api.telegram.org intermittently blackholes (3/12 connects failed in testing) and Python's
+# requests doesn't fall back quickly, which stalled getUpdates for 30-60s. Default to IPv4 (FORCE_IPV4=0 to disable).
+if os.environ.get("FORCE_IPV4", "1") != "0":
+    import socket, urllib3.util.connection as _u3c
+    _u3c.allowed_gai_family = lambda: socket.AF_INET
+
 def load_state():
     try: return json.load(open(STATE))
     except Exception: return {"subscribers": [], "tg_offset": 0, "seen": []}
@@ -257,14 +282,20 @@ def tg_reply(chat, text):
     try: requests.post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": text}, timeout=15)
     except Exception as e: log.warning("tg reply %s: %s", chat, e)
 
+_tls = threading.local()
+def _tg_session():
+    """Per-thread keep-alive session for command replies (no new TLS handshake per reply)."""
+    if getattr(_tls, "s", None) is None: _tls.s = requests.Session()
+    return _tls.s
+
 def tg_reply_html(chat, text):
     """Command replies: only to the requesting chat (never tg_send_all). HTML, plain-text fallback."""
     try:
-        r = requests.post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
+        r = _tg_session().post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
         if not r.ok:
             log.warning("tg cmd reply %s failed: %s; retrying plain", chat, r.text[:200])
-            requests.post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": html_to_plain(text), "disable_web_page_preview": True}, timeout=15)
-    except Exception as e: log.warning("tg cmd reply %s: %s", chat, e)
+            _tg_session().post(f"{TGAPI}/sendMessage", json={"chat_id": chat, "text": html_to_plain(text), "disable_web_page_preview": True}, timeout=15)
+    except Exception as e: log.warning("tg cmd reply %s: %s", chat, e); _tls.s = None
 
 # ---- Telegram commands (Phase 3). One bot identity; research goes to Queen via research/ (local HTTP). ----
 import telegram_cmds as tc
@@ -317,7 +348,8 @@ def tg_handle_update(u):
         if status in ("kicked", "left") and chat in state["subscribers"]:
             state["subscribers"].remove(chat); log.info("UNSUBSCRIBED %s (blocked)", chat)
         return
-    log.info("update %s kinds=%s chat=%s text=%r", uid, kinds, chat, txt[:40])
+    t_recv = time.time(); lag = t_recv - msg["date"] if msg.get("date") else None
+    log.info("update %s kinds=%s chat=%s text=%r%s", uid, kinds, chat, txt[:40], f" lag={lag:.1f}s" if lag is not None else "")
     if not chat: return
     p = tc.parse_command(txt, BOT_USERNAME[0])
     if p is None: return   # plain text, or a command for another bot
@@ -331,7 +363,7 @@ def tg_handle_update(u):
         else:
             tg_reply(chat, "✅ Already subscribed. /stop to unsubscribe.")
         return
-    CMDS.handle(chat, user, p)   # access check + enqueue only; never blocks on network
+    CMDS.handle(chat, user, p, t_recv)   # access check + enqueue only; never blocks on network
 
 def tg_bot_username():
     if BOT_USERNAME[0]: return BOT_USERNAME[0]
@@ -344,10 +376,13 @@ def tg_bot_username():
 def tg_poll():
     log.info("tg poll started (offset %s, %d subscribers)", state["tg_offset"], len(state["subscribers"]))
     tg_bot_username()
+    sess = requests.Session()   # keep-alive: one connection reused across long polls
     while True:
         try:
-            r = requests.get(f"{TGAPI}/getUpdates", params={"offset": state["tg_offset"], "timeout": 25,
-                             "allowed_updates": json.dumps(["message", "edited_message", "my_chat_member", "channel_post"])}, timeout=40)
+            t0 = time.time()
+            r = sess.get(f"{TGAPI}/getUpdates", params={"offset": state["tg_offset"], "timeout": 25,
+                         "allowed_updates": json.dumps(["message", "edited_message", "my_chat_member", "channel_post"])}, timeout=(5, 35))
+            if time.time() - t0 > 30: log.warning("tg getUpdates slow: %.1fs", time.time() - t0)
             j = r.json()
             if not j.get("ok"):
                 log.warning("tg getUpdates not ok: %s %s", r.status_code, j.get("description")); time.sleep(10); continue
@@ -359,7 +394,7 @@ def tg_poll():
         except requests.exceptions.ReadTimeout:
             continue
         except Exception as e:
-            log.warning("tg poll: %s", str(e)[:200]); time.sleep(5)
+            log.warning("tg poll: %s", str(e)[:200]); sess = requests.Session(); time.sleep(1)
 
 def tg_supervisor():
     while True:
@@ -582,6 +617,7 @@ async def ws_loop():
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         handlers=[logging.FileHandler(os.path.join(DIR, "bot.log")), logging.StreamHandler()])
+    for h in logging.getLogger().handlers: h.addFilter(REDACT)
     logging.getLogger("websockets").setLevel(logging.WARNING)
     if len(sys.argv) > 2 and sys.argv[1] == "--replay":
         msgs = handle_sig(sys.argv[2], send=False, prefix="🧪 TEST (replay of past claim)\n")
