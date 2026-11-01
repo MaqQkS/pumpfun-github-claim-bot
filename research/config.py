@@ -95,12 +95,12 @@ class Settings:
     # Queen instances: the model is fixed per instance (Queen has no per-request model override)
     standard_url: str = "http://127.0.0.1:8790"
     standard_model: str = "grok-4.3"
-    standard_effort: str = "low"
+    standard_effort: str = "high"
     deep_url: str = "http://127.0.0.1:8791"
     deep_model: str = "grok-4.7"
     deep_effort: str = "low"
     deep_enabled: bool = False                  # /d is refused unless this is true
-    timeout_standard_s: float = 90.0
+    timeout_standard_s: float = 190.0
     timeout_deep_s: float = 120.0
     max_in_flight: int = 1
     max_retries: int = 2                        # transient errors only (connection refused, 502/503, 429)
@@ -109,7 +109,7 @@ class Settings:
     # USD budgets (local accounting, see README: not a provider hard cap)
     budget_total_usd: float = 5.00
     budget_daily_usd: float = 0.50
-    worst_case_usd: dict = field(default_factory=lambda: {"grok-4.3": 0.05, "grok-4.7": 0.15})
+    worst_case_usd: dict = field(default_factory=lambda: {"grok-4.3": 0.20, "grok-4.7": 0.15})
     # Helius credits (Queen's own key; estimates, not Helius billing)
     helius_est_per_research: int = 205
     helius_worst_case: int = 400

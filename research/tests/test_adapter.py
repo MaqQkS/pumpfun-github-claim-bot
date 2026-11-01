@@ -11,6 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from research import load_settings, route
+
+LOGIC_WC = {"grok-4.3": 0.05, "grok-4.7": 0.15}   # fixed fixture value for budget-logic tests (prod default is checked separately)
 from research.adapter import ResearchAdapter
 from research.client import QueenClient, QueenBadResponse, QueenBusy, QueenTimeout, QueenUnavailable
 from research.config import COMMANDS, TIER_AI, TIER_DIRECT, TIER_UNAVAILABLE
@@ -98,7 +100,7 @@ class Base(unittest.TestCase):
         self.addCleanup(self.stub.close)
         s = load_settings(env_file=os.path.join(self.tmp, "none.env"), environ={}, standard_url=self.stub.url,
                           deep_url=self.stub.url, ledger_path=os.path.join(self.tmp, "l.sqlite3"),
-                          meter_path=self.meter, retry_backoff_s=0.01, **kw)
+                          meter_path=self.meter, retry_backoff_s=0.01, **{"worst_case_usd": LOGIC_WC, **kw})
         return ResearchAdapter(s, sleep=lambda _x: None)
 
 
@@ -116,7 +118,7 @@ class TestRouting(unittest.TestCase):
             p = route(f"{c} {FFM}", self.s)
             self.assertTrue(p.uses_llm, c)
             self.assertEqual(p.model, "grok-4.3", c)
-            self.assertEqual(p.effort, "low")
+            self.assertEqual(p.effort, "high")
             self.assertFalse(p.deep)
 
     def test_length_never_changes_model(self):

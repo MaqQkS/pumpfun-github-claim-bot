@@ -21,7 +21,7 @@ export HARNESS_IN_FLIGHT_MAX=1
 export TOOLS_XSEARCH=0 TOOLS_NEWS=0 TOOLS_CTRADAR=0 TOOLS_HUB=0
 cd "$QUEEN_DIR"
 case $MODE in
-  standard) export PORT=8790 LLM_MODEL=grok-4.3 LLM_EXTRA_BODY='{"reasoning_effort":"low"}' ;;
+  standard) export PORT=8790 LLM_MODEL=grok-4.3 LLM_EXTRA_BODY='{"reasoning_effort":"high"}' ;;
   deep)     export PORT=8791 LLM_MODEL=grok-4.7 LLM_EXTRA_BODY='{"reasoning_effort":"low"}'
             export METER_OUT="$DATA/queen-meter-deep.jsonl" ;;
   *) echo "usage: $0 standard|deep" >&2; exit 2 ;;

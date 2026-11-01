@@ -58,7 +58,8 @@ class TestCommands(unittest.TestCase):
 
     def test_research_route_is_43_low_no_escalation(self):
         st = load_settings(env_file="/nonexistent", environ={})
-        self.assertEqual((st.standard_model, st.standard_effort, st.deep_enabled), ("grok-4.3", "low", False))
+        self.assertEqual((st.standard_model, st.standard_effort, st.deep_enabled), ("grok-4.3", "high", False))
+        self.assertEqual(st.worst_case_usd["grok-4.3"], 0.20); self.assertEqual(st.timeout_standard_s, 190.0)
         from research import route
         for t in (f"/re {FFM}", f"/research {FFM} please go deep and thorough " * 3, f"/d re {FFM}"):
             p = route(t, st)

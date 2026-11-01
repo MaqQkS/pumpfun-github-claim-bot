@@ -260,7 +260,7 @@ class TestBotIntegration(TestAlertsUnchanged):
         class S:
             def enqueue_auto(self, job): calls.append(("enqueue", job.chat, job.mint, job.alert_msg_id)); posted.append(("enqueue",)); return True, "queued"
             def adapter(self):
-                return types.SimpleNamespace(ledger=Ledger(str(tmp("l.sqlite3"))), s=__import__("research").load_settings(env_file="/x", environ={}))
+                return types.SimpleNamespace(ledger=Ledger(str(tmp("l.sqlite3"))), s=__import__("research").load_settings(env_file="/x", environ={}, worst_case_usd={"grok-4.3": 0.05, "grok-4.7": 0.15}))
         bot.AUTO = ar.AutoResearch(cfg, ar.JobStore(tmp("j.sqlite3")), S(), bot.ALERTS)
         bot.get_tx = lambda sig: self.tx("2sMrGNK8i36YRkF5WWCwnaUYuwDJhHe1g2xA8aPvhkjM")
         bot.decode_claims = lambda t: [dict(self.claim())]

@@ -53,3 +53,8 @@ Emergency without a restart: stop Queen (`research/queen/queen_up.sh stop`). Aut
 - Code: Use `git revert` (no reset or force-push). For example `git checkout a0375f5 -- .`
   on a revert commit, or `git revert <phase6-fixes commits>`, then `./start.sh`. The ledger, alert_map and auto_jobs sqlite files are
   forward-compatible and can stay.
+
+## Note (10:33 PM CDT Oct 31): /re now runs grok-4.3 at HIGH reasoning effort
+The worst-case reservation per grok-4.3 run is now $0.20 (was $0.05). The auto cap is checked against that worst case,
+so `AUTO_RESEARCH_DAILY_USD=0.15` would refuse every auto job. If the pilot is approved, it needs
+`AUTO_RESEARCH_DAILY_USD=0.60` (3 × $0.20), or auto jobs must keep low effort. That is Bala's decision.
