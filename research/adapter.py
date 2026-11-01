@@ -76,7 +76,7 @@ class ResearchAdapter:
             facts = ClaimFacts(mint=plan.mint)
         if source == "auto" and plan.deep:
             return ResearchResult(False, plan, "Automatic research never uses deep mode.", "deep_disabled")
-        key = (plan.command, "deep" if plan.deep else "standard", plan.model, plan.mint)
+        key = (plan.command, "deep" if plan.deep else "standard", plan.model, plan.mint, claim_identity(facts))
         now = time.time()
         with self._lock:
             hit = self._cache.get(key)
@@ -150,3 +150,13 @@ class ResearchAdapter:
     def _reconcile(self, mark: int) -> dict | None:
         self._sleep(0.3)   # the meter writes usage just after the response body is read
         return self.meter.read_since(mark)
+
+
+def claim_identity(facts) -> str:
+    """Cache/coalescing identity of the verified claim context: a new GitClaim event (claim tx, claimant, amount)
+    on the same mint never reuses an answer built from another claim's facts. 'none' when there are no facts."""
+    import hashlib
+    if facts is None or not (getattr(facts, "tx_signature", None) or getattr(facts, "github_login", None) or getattr(facts, "claim_sol", None)):
+        return "none"
+    raw = f"{facts.tx_signature}|{facts.github_login}|{facts.claim_sol}|{facts.claim_kind}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]

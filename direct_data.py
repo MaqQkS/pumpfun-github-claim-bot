@@ -110,18 +110,43 @@ def queen_rpc_url() -> str | None:
     return f"https://mainnet.helius-rpc.com/?api-key={key}" if key else None
 
 
-HELIUS_SINK = [None]       # Phase 6: callable(method, credits) -> durable ledger (set by CommandService)
+HELIUS_GUARD = [None]      # Phase 6 fix: callable(method, credits, source, limits) -> bool. Reserves BEFORE the call.
+HELIUS_SINK = HELIUS_GUARD # backwards-compatible name
 HELIUS_CREDITS = {"getAsset": 10}   # local estimate; standard RPC methods ~1 credit. Provider billing is authoritative.
+_SCOPE = threading.local()  # research source for this thread: ("manual"|"auto", auto_limits)
+
+
+class HeliusBudgetError(IOError):
+    pass
+
+
+class helius_scope:
+    """with helius_scope("auto", limits): direct research Helius calls in this thread count against the auto sub-limit."""
+    def __init__(self, source="manual", limits=None):
+        self.v = (source, limits)
+
+    def __enter__(self):
+        self.prev = getattr(_SCOPE, "v", None); _SCOPE.v = self.v
+
+    def __exit__(self, *a):
+        _SCOPE.v = self.prev
 
 
 def _rpc(url, method, params, http=requests):
-    CALLS["helius:" + method] += 1
-    sink = HELIUS_SINK[0]
-    if sink is not None:
+    """Research-side Helius RPC on QUEEN's key only (the production scanner uses bot.rpc, never this).
+    With a guard installed (production), the call happens only if the durable ledger reserved its credits first;
+    a budget refusal or any ledger error fails CLOSED (no request is sent)."""
+    guard = HELIUS_GUARD[0]
+    if guard is not None:
+        source, limits = getattr(_SCOPE, "v", None) or ("manual", None)
         try:
-            sink(method, HELIUS_CREDITS.get(method, 1))
+            ok = guard(method, HELIUS_CREDITS.get(method, 1), source, limits)
         except Exception:
-            pass
+            ok = False
+        if not ok:
+            CALLS["helius_refused:" + method] += 1
+            raise HeliusBudgetError("Helius budget reached or ledger unavailable")
+    CALLS["helius:" + method] += 1
     r = http.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=8)
     if not r.ok:
         raise IOError(f"HTTP {r.status_code}")

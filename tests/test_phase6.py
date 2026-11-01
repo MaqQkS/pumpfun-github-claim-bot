@@ -293,6 +293,7 @@ class TestBotIntegration(TestAlertsUnchanged):
                 {"signature": SIG, "blockTime": now - 30}, {"signature": "OLD", "blockTime": now - 99999}, {"signature": "ERR", "blockTime": now, "err": {"InstructionError": [0, 1]}}]
         bot.state["seen"] = [SIG]
         seen_order = []
+        _orig = bot.rpc; self.addCleanup(setattr, bot, "rpc", _orig)
         bot.rpc = lambda m, p, tries=3: sigs if m == "getSignaturesForAddress" else None
         orig = bot._handle_sig
         bot._handle_sig = lambda sig, send=True, prefix="", origin="live": (seen_order.append((sig, origin)), orig(sig, send, prefix, origin))[1]
@@ -305,6 +306,7 @@ class TestBotIntegration(TestAlertsUnchanged):
 
     def test_catchup_off_by_default(self):
         bot, posted, calls = self.setup_bot()
+        _orig = bot.rpc; self.addCleanup(setattr, bot, "rpc", _orig)
         bot.rpc = lambda *a, **k: self.fail("no RPC when catch-up is off")
         self.assertEqual(bot.catchup_once(), 0)
 

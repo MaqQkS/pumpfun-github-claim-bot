@@ -224,8 +224,8 @@ class CommandService:
         self._auto_q: deque = deque()                    # Phase 6: auto jobs wait here; manual _q always first
         self.auto_max_queue = auto_max_queue
         self.auto_calls = 0
-        if durable_helius:                               # direct Helius reads on Queen's key -> durable ledger
-            dd.HELIUS_SINK[0] = self._record_helius
+        if durable_helius:                               # direct Helius reads on Queen's key: reserve first, fail closed
+            dd.HELIUS_GUARD[0] = self._helius_guard
         self._reply_ctx = None
         self._adapter_factory = adapter_factory or _default_adapter
         self._adapter = None
@@ -241,21 +241,34 @@ class CommandService:
         self._worker = None
         self.llm_calls = 0                               # research jobs handed to the adapter (tests assert on it)
 
-    def _record_helius(self, method, credits):
-        led = getattr(self.adapter(), "ledger", None)
-        if led is not None:
-            led.record_direct_helius(method, credits)
+    def _helius_guard(self, method, credits, source="manual", limits=None) -> bool:
+        a = self.adapter()
+        return a.ledger.reserve_direct_helius(a.s, method, credits, source, limits)   # raises -> dd fails closed
+
+    _record_helius = _helius_guard                   # name used by bot.main()
 
     def _helius_ok(self, need: int) -> str | None:
-        """None when allowed, else the reason. Only enforced when the durable ledger is in use."""
-        if dd.HELIUS_SINK[0] is None:
+        """Pre-check so /ho doesn't start a partial lookup. Fails CLOSED on ledger errors when enforcement is on."""
+        if dd.HELIUS_GUARD[0] is None:
             return None
         try:
             a = self.adapter()
             dec = a.ledger.helius_allowed(a.s, need)
             return None if dec.ok else dec.reason
         except Exception:
-            return None
+            return "ledger unavailable"
+
+    def _budget_precheck(self, source="manual", limits=None) -> str | None:
+        """xAI/Helius budget check BEFORE any free context gathering, so a refused job makes no direct Helius calls."""
+        try:
+            a = self.adapter()
+            led, s = getattr(a, "ledger", None), getattr(a, "s", None)
+            if led is None or s is None:
+                return None                              # test doubles without a ledger
+            dec = led.check(settings=s, model=s.standard_model, source=source, auto=limits)
+            return None if dec.ok else dec.reason
+        except Exception:
+            return "ledger unavailable"
 
     # access ---------------------------------------------------------------
     def allowed(self, chat_id, user_id) -> bool:
@@ -475,10 +488,15 @@ class CommandService:
     def _run_auto(self, job):
         """Auto research: same adapter/formatter as /re, source='auto' budget, reply to the original alert."""
         import project_context as pc
+        why = self._budget_precheck("auto", job.limits)
+        if why:                                          # rejected before ANY context read (no direct Helius calls)
+            self._finish_auto(job, "skipped", f"budget: {why}")
+            return
         job.mark("running")
         pctx = None
         try:
-            pctx = pc.gather(job.mint, getattr(job.facts, "github_login", None), http=self.http, rpc_url=self.rpc_url)
+            with dd.helius_scope("auto", job.limits):
+                pctx = pc.gather(job.mint, getattr(job.facts, "github_login", None), http=self.http, rpc_url=self.rpc_url)
         except Exception:
             pass
         self.auto_calls += 1
@@ -512,6 +530,9 @@ class CommandService:
                 facts = None
         import project_context as pc
         pctx = None
+        why = self._budget_precheck()
+        if why:
+            return f"💸 Research paused: budget limit reached ({E(why)}). Alerts are unaffected.\n<code>{E(job.mint)}</code>"
         try:                                                        # free reads, inside the single research slot
             pctx = pc.gather(job.mint, getattr(facts, "github_login", None), http=self.http,
                              rpc_url=self.rpc_url)
@@ -615,6 +636,11 @@ def format_liquidity(mint: str, d: dict) -> str:
         return f"⚠️ Liquidity unavailable: {E(d.get('error', 'error'))}"
     if not d.get("pairs"):
         return f"💧 No DexScreener pool for <code>{E(_short(mint))}</code> yet (bonding curve or not indexed)."
+    if str(d.get("dex")).lower() == "pumpfun" or d.get("liq_usd") is None:      # pump.fun bonding curve: no pool liquidity
+        link = f'<a href="https://dexscreener.com/solana/{E(d["pair"])}">DexScreener</a> · ' if d.get("pair") else ""
+        return "\n".join([f"💧 <b>${E(str(d.get('symbol') or '?'))}</b>: on bonding curve",
+                          f"📈 MC {dd.money(d.get('mc'))} · Vol 24h {dd.money(d.get('vol24'))}",
+                          f"🔗 {link}<code>{E(_short(mint))}</code>"])
     sol = f" ({d['liq_quote']:,.1f} {E(str(d.get('quote')))})" if d.get("liq_quote") else ""
     dex = {"pumpswap": "PumpSwap", "raydium": "Raydium", "meteora": "Meteora", "orca": "Orca"}.get(str(d.get("dex")), str(d.get("dex")))
     more = f" · {d['pairs']} pools, {dd.money(d.get('total_liq'))} total" if d["pairs"] > 1 else ""

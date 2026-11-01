@@ -719,7 +719,7 @@ def main():
     threading.Thread(target=tg_supervisor, daemon=True).start()
     threading.Thread(target=log_usage_loop, daemon=True).start()
     threading.Thread(target=authority_check_loop, daemon=True).start()
-    tc.dd.HELIUS_SINK[0] = CMDS._record_helius    # durable Helius accounting for research reads (Queen's key); runtime only
+    tc.dd.HELIUS_GUARD[0] = CMDS._helius_guard    # research Helius reads (Queen's key): reserve in ledger first, fail closed; runtime only
     AUTO.recover()
     log.info("auto research %s (chats=%d, max/day=%d, $%.2f/day) · catch-up %s", "ON" if AUTO.cfg.enabled else "off",
              len(AUTO.cfg.chats), AUTO.cfg.max_per_day, AUTO.cfg.daily_usd, "ON" if AUTO.cfg.catchup_enabled else "off")
