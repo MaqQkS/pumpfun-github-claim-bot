@@ -11,3 +11,14 @@ state.json.tmp
 research/data/*
 !research/data/.gitkeep
 research/research.env
+
+# secrets and backups (token rotation creates .env.bak-<timestamp>)
+.env.*
+*.env
+*.env.*
+.env.bak*
+*.env.bak*
+!research/research.env.example
+*.pem
+*.key
+id_rsa*

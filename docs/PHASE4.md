@@ -32,15 +32,17 @@ Scope the menu to the private group only, never default scope:
 allowlist; the menu is cosmetic.
 
 ## Token rotation (before deployment)
-1. BotFather -> /mybots -> @GitClaimed_bot -> API Token -> Revoke current token. Copy the new token (don't paste it in chat).
-2. `cd ~/pumpfun-github-claim-bot && scripts/rotate_telegram_token.sh` (needs this branch merged, or copy the script).
-   Hidden input; checks new getMe=200 and old getMe=401 (status codes only); atomic `.env` replace (600, private
-   backup `.env.bak-*`); `./start.sh`; checks only NEW log lines contain 0 occurrences of the new token.
-3. Restart scope: only bot.py (start.sh recreates run.sh + caffeinate). Queen holds no Telegram token and keeps
-   running (queen_up.sh is a no-op when already supervised). Downtime ~3–5 s. There is no startup backfill of the claim
-   websocket, so a claim landing in those seconds would not alert; pick a quiet moment. Telegram queues commands sent
-   meanwhile (offset kept in state.json). Historical logs with the old token stay in place; after rotation that token
-   returns 401. Delete or redact them only when Bala decides they are no longer needed.
+1. BotFather -> /mybots -> @GitClaimed_bot -> API Token -> Revoke current token. Copy the new token (never paste it in chat).
+2. `cd ~/pumpfun-github-claim-bot && scripts/rotate_telegram_token.sh`
+   Fails closed: aborts with "Nothing was changed" unless new getMe = 200 AND old getMe = 401. Hidden input; tokens go
+   to curl via stdin (never argv); output is status codes and counts only. On success: `.env.bak-<timestamp>` (600),
+   atomic `.env` replace (600), ONE `./start.sh` (bot only; Queen untouched), then prints bot.py count, polling /
+   websocket / username lines, subscriber count, Queen /health, and new/old-token hits in post-restart log lines (want 0).
+   Tested by `tests/test_rotate_script.py` with a mock curl.
+3. Restart scope: only bot.py. Downtime ~3–5 s; no claim backfill, so pick a quiet moment. Historical logs are not
+   touched; the old token is dead afterwards (401).
+4. Code rollback never touches credentials: `.env`, `.env.bak-*` and `research/research.env` are gitignored and
+   untracked, so `git revert` / `git reset --keep` leave the new token and state.json (subscribers) as they are.
 
 ## Deploy (needs approval)
 1. Rotate token (above). 2. `cd ~/pumpfun-github-claim-bot && git merge --ff-only phase4-reply-to-alert`
