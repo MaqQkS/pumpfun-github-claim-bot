@@ -397,10 +397,11 @@ def tg_handle_update(u):
             tg_reply(chat, "✅ Already subscribed. /stop to unsubscribe.")
         return
     reply = None
-    if p.name in REPLY_COMMANDS and msg.get("reply_to_message") and CMDS.allowed(chat, user):
+    ctype = (msg.get("chat") or {}).get("type")
+    if p.name in REPLY_COMMANDS and msg.get("reply_to_message") and CMDS.allowed(chat, user, ctype):
         reply = resolve_reply(msg, BOT_ID[0], ALERTS)   # local sqlite + text parse only; no network
         if reply: log.info("cmd /%s reply-to msg %s -> %s", p.name, msg["reply_to_message"].get("message_id"), reply.source or "rejected")
-    CMDS.handle(chat, user, p, t_recv, reply)   # access check + enqueue only; never blocks on network
+    CMDS.handle(chat, user, p, t_recv, reply, chat_type=ctype)   # access check + enqueue only; never blocks on network
 
 def tg_bot_username():
     if BOT_USERNAME[0] and BOT_ID[0]: return BOT_USERNAME[0]

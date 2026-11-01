@@ -16,6 +16,7 @@ import queue
 import re
 import threading
 import time
+import types
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -133,6 +134,10 @@ class CmdConfig:
     chats: frozenset = frozenset({-5178862838, 2038104261}) # RESEARCH_CHAT_IDS (Queen Harness Tests + Bala DM)
     max_queue: int = 3                                      # research jobs waiting behind the running one
     direct_workers: int = 2
+    open_groups: frozenset = frozenset()                    # RESEARCH_OPEN_GROUP_CHAT_IDS: ANY member may use operational commands
+    open_user_max: int = 3                                  # RESEARCH_OPEN_GROUP_USER_MAX_PER_DAY (paid /re, UTC day)
+    open_group_max: int = 10                                # RESEARCH_OPEN_GROUP_MAX_PER_DAY
+    open_group_usd: float = 0.25                            # RESEARCH_OPEN_GROUP_DAILY_USD
 
     @classmethod
     def from_env(cls, env=None, env_file=None):
@@ -147,7 +152,11 @@ class CmdConfig:
         return cls(enabled=env.get("RESEARCH_COMMANDS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"),
                    testers=_ids(env["RESEARCH_TESTER_IDS"]) if env.get("RESEARCH_TESTER_IDS") else d.testers,
                    chats=_ids(env["RESEARCH_CHAT_IDS"]) if env.get("RESEARCH_CHAT_IDS") else d.chats,
-                   max_queue=int(env.get("RESEARCH_MAX_QUEUE", d.max_queue)))
+                   max_queue=int(env.get("RESEARCH_MAX_QUEUE", d.max_queue)),
+                   open_groups=frozenset(i for i in _ids(env.get("RESEARCH_OPEN_GROUP_CHAT_IDS") or "") if i < 0),
+                   open_user_max=int(env.get("RESEARCH_OPEN_GROUP_USER_MAX_PER_DAY", d.open_user_max)),
+                   open_group_max=int(env.get("RESEARCH_OPEN_GROUP_MAX_PER_DAY", d.open_group_max)),
+                   open_group_usd=float(env.get("RESEARCH_OPEN_GROUP_DAILY_USD", d.open_group_usd)))
 
 
 # ---- bot context (what the commands may read from GitClaim) -----------------------------------
@@ -212,6 +221,7 @@ class _Job:
     facts: object = None
     enqueued: float = field(default_factory=time.time)
     origin: str | None = None        # reply-to-alert: "stored" | "parsed"; None for /re <CA>
+    quota_row: int | None = None     # open-group quota reservation (None for allowlisted testers)
     auto: bool = False               # Phase 6 automatic research job
     stale_at: float | None = None
 
@@ -224,6 +234,8 @@ class CommandService:
         self._auto_q: deque = deque()                    # Phase 6: auto jobs wait here; manual _q always first
         self.auto_max_queue = auto_max_queue
         self.auto_calls = 0
+        self._quota = None                               # open-group quota store (lazy)
+        self._open_user = None
         if durable_helius:                               # direct Helius reads on Queen's key: reserve first, fail closed
             dd.HELIUS_GUARD[0] = self._helius_guard
         self._reply_ctx = None
@@ -271,16 +283,35 @@ class CommandService:
             return "ledger unavailable"
 
     # access ---------------------------------------------------------------
-    def allowed(self, chat_id, user_id) -> bool:
-        return self.cfg.enabled and chat_id in self.cfg.chats and user_id in self.cfg.testers
+    def allowed(self, chat_id, user_id, chat_type=None) -> bool:
+        return self.cfg.enabled and (self._allowlisted(chat_id, user_id) or self._open(chat_id, user_id, chat_type))
+
+    def _allowlisted(self, chat_id, user_id) -> bool:
+        return chat_id in self.cfg.chats and user_id in self.cfg.testers
+
+    def _open(self, chat_id, user_id, chat_type) -> bool:
+        """Open group: explicitly configured negative chat id AND Telegram says group/supergroup (never a DM)."""
+        return (chat_id in self.cfg.open_groups and chat_type in ("group", "supergroup")
+                and isinstance(user_id, int) and user_id > 0)
+
+    def quota(self):
+        if self._quota is None:
+            import open_quota
+            from research.config import HERE
+            self._quota = open_quota.OpenGroupQuota(str(HERE / "data" / "open_group_quota.sqlite3"),
+                                                    user_max=self.cfg.open_user_max, group_max=self.cfg.open_group_max,
+                                                    group_usd=self.cfg.open_group_usd)
+        return self._quota
 
     # entry point from the poll thread: must not block -----------------------
-    def handle(self, chat_id: int, user_id: int | None, p: Parsed, t_recv: float | None = None, reply=None) -> bool:
+    def handle(self, chat_id: int, user_id: int | None, p: Parsed, t_recv: float | None = None, reply=None,
+               chat_type: str | None = None) -> bool:
         """Returns True when the command was accepted (reply will follow), False when ignored.
         `reply` is an alert_map.Resolution when the command replied to a message (Phase 4), else None."""
-        if not self.allowed(chat_id, user_id):
+        if not self.allowed(chat_id, user_id, chat_type):
             log.info("cmd /%s ignored (chat=%s user=%s not allowlisted or commands disabled)", p.name, chat_id, user_id)
             return False
+        self._open_user = None if self._allowlisted(chat_id, user_id) else user_id   # quota applies to open access only
         self._reply_ctx = None                  # only read synchronously on the poll thread (captured for /gh)
         if reply is not None and p.known and not p.deep and p.name in REPLY_COMMANDS and not _explicit_target(p):
             if reply.error:
@@ -376,6 +407,24 @@ class CommandService:
             self._submit_direct(key, lambda: "Send a CA: <code>/re &lt;CA&gt;</code> (base58, 32–44 chars). Or reply <code>/re</code> to a GitClaim alert.", chat)
             return True
         job = _Job(chat, mint, key)
+        ou = getattr(self, "_open_user", None)
+        if ou is not None:                                   # open group, non-allowlisted user: reserve quota first
+            try:
+                a = self.adapter()
+                wc = float(a.s.worst_case_usd.get(a.s.standard_model, max(a.s.worst_case_usd.values())))
+            except Exception:
+                wc = 0.20
+            try:
+                job.quota_row, why = self.quota().reserve(chat, ou, mint, wc)
+            except Exception as e:
+                log.warning("open-group quota unavailable: %s", type(e).__name__)
+                why = "the usage tracker is unavailable"
+            if why:
+                self._done(key)
+                log.info("cmd /research open-group limit chat=%s user=%s: %s", chat, ou, why)
+                self._submit_direct(key, lambda: f"🧮 Research limit reached: {E(why)}. Resets 00:00 UTC. "
+                                                 "Free commands (/liq /ho /gh /st) still work.", chat)
+                return True
         rc = getattr(self, "_reply_ctx", None)
         if rc is not None and rc.mint == mint:
             job.origin = rc.source
@@ -388,6 +437,7 @@ class CommandService:
             except queue.Full:
                 self._inflight.discard(key)
                 full = True
+                self._quota_settle(job, None)
             else:
                 full = False
                 pos = self._q.qsize() + (1 if busy else 0)
@@ -532,6 +582,7 @@ class CommandService:
         pctx = None
         why = self._budget_precheck()
         if why:
+            self._quota_settle(job, types.SimpleNamespace(ok=False, cached=False, deduped=False, usage=None, ledger_id=None))
             return f"💸 Research paused: budget limit reached ({E(why)}). Alerts are unaffected.\n<code>{E(job.mint)}</code>"
         try:                                                        # free reads, inside the single research slot
             pctx = pc.gather(job.mint, getattr(facts, "github_login", None), http=self.http,
@@ -540,8 +591,29 @@ class CommandService:
         except Exception as e:
             log.warning("re context failed: %s", type(e).__name__)
         self.llm_calls += 1
-        res = self.adapter().research(f"re {job.mint}", facts, pc.context_block(pctx) if pctx else None)
+        res = None
+        try:
+            res = self.adapter().research(f"re {job.mint}", facts, pc.context_block(pctx) if pctx else None)
+        finally:
+            self._quota_settle(job, res)
         return format_research(job.mint, res, facts, pctx, origin=job.origin)
+
+    def _quota_settle(self, job, res):
+        """Reconcile an open-group reservation: a NEW paid LLM call counts at actual cost; cache hits, coalesced
+        duplicates, refusals and failures before any call are released. Unknown outcome keeps the worst case."""
+        row, job.quota_row = job.quota_row, None
+        if row is None:
+            return
+        try:
+            usage = getattr(res, "usage", None) or {}
+            paid = res is not None and not res.cached and not res.deduped and (
+                res.ok or usage.get("actual_usd") or getattr(res, "ledger_id", None) is not None)
+            if res is not None and not paid:
+                self.quota().release(row)
+            else:
+                self.quota().finish(row, usage.get("actual_usd") if res is not None else None)
+        except Exception as e:
+            log.warning("open-group quota settle failed: %s", type(e).__name__)
 
     # ---- direct handlers (no LLM) ------------------------------------------
     def _mint_arg(self, args):

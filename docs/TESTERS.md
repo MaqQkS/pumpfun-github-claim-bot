@@ -22,3 +22,14 @@ Adding/removing testers never touches `state.json` or subscribers (`tests/test_p
 - AI text is scrubbed of local paths (/Users/…), emails, key/token-looking strings and config names before sending
   (`telegram_cmds.scrub_ai_text`). Verified GitClaim facts are rendered separately from AI interpretation.
 - Budget: ledger limits in research.env (currently $5/day, $5 total). Each /re ≈ $0.02.
+
+## Open group access (RESEARCH_OPEN_GROUP_CHAT_IDS)
+- Chats listed in `RESEARCH_OPEN_GROUP_CHAT_IDS` (negative group ids only) let **any member** use the operational commands
+  (/h /st /re /ho /liq /gh, all aliases, and reply-to-alert). Unfinished commands still say "coming soon"; /d stays disabled.
+- It only applies when Telegram reports the chat as `group`/`supergroup`. DMs and every other chat keep the tester + chat allowlist.
+  New groups are never opened automatically.
+- Paid /re by non-testers in an open group is limited per UTC day: per user (default 3), per group (10), and group USD (0.25).
+  Each /re reserves the worst case ($0.20 at high effort) when accepted. Afterwards the reservation drops to the actual cost.
+  Cache hits, coalesced duplicates and budget refusals are released (not counted). An attempted Queen call that failed still counts.
+  If the quota store errors, /re is refused (fail closed). Global $ and Helius budgets are checked after the quota.
+- Revoke immediately: remove the id from `RESEARCH_OPEN_GROUP_CHAT_IDS`, then `./start.sh`.
