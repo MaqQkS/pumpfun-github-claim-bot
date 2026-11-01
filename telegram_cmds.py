@@ -194,6 +194,7 @@ def help_text(cfg: CmdConfig | None = None) -> str:
     L = ["🐙 <b>GitClaim commands</b> (test build)", "", "✅ <b>Available</b>"]
     L += [f"{fmt(s)} — {E(s.summary)}" for s in av]
     L += ["", "Use a CA: <code>/re &lt;CA&gt;</code> · <code>/gh &lt;user|owner/repo|CA&gt;</code>",
+          "💬 Or reply to a GitClaim alert with /re /ho /gh /liq (no CA needed).",
           "", "🕒 <b>Coming soon</b>"]
     L.append(" ".join(f"/{s.aliases[0] if s.aliases else s.name}" for s in soon))
     L += ["", "🔬 <code>/d re|dev|wa &lt;CA&gt;</code> deep mode (grok-4.7) — disabled for now",
@@ -584,7 +585,7 @@ def format_research(mint: str, res, facts=None, pctx=None, origin=None) -> str:
     raw = re.sub(r"\n?```token\n.*?\n```\n?", "\n", raw, flags=re.S)
     urep = sanitize_urls(raw, trusted)
     arep = preserve_addresses(urep.text, trusted)
-    parts = _split_answer(arep.text)
+    parts = _split_answer(scrub_ai_text(arep.text))
     narrative = " ".join(parts["NARRATIVE"]) or " ".join([x for x in parts["_pre"] if not x.startswith(("-", "•", "*"))][:3])
     verdict = " ".join(parts["VERDICT"])
     data = [x.lstrip("-•* ").strip() for x in parts["DATA"] if x.lstrip().startswith(("-", "•", "*"))] or \
@@ -672,3 +673,23 @@ def facts_from_meta(meta: dict | None, mint: str):
         return ClaimFacts(**f)
     except TypeError:
         return None
+
+
+# ---- Phase 5: scrub AI text of local/secret-looking details before it reaches Telegram ------------
+_SCRUB = [
+    (re.compile(r"(?:/Users|/home|/private/var|/var/folders|/tmp)/[^\s<>\"')]+"), "[local path]"),
+    (re.compile(r"[A-Za-z]:\\(?:Users|Windows)\\[^\s<>\"')]+"), "[local path]"),
+    (re.compile(r"\bxai-[A-Za-z0-9]{10,}"), "[redacted]"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), "[redacted]"),
+    (re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{30,}"), "[redacted]"),
+    (re.compile(r"(?i)api[-_]?key=[^\s&<>\"']+"), "api-key=[redacted]"),
+    (re.compile(r"\b[A-Z][A-Z0-9_]*_(?:API_KEYS?|KEY|TOKEN|SECRET|PASSWORD)S?\b(?:\s*=\s*\S+)?"), "[config name]"),
+    (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "[email]"),
+]
+
+
+def scrub_ai_text(text: str) -> str:
+    """AI text only (verified GitClaim facts are rendered separately). Never touches Solana addresses or https URLs."""
+    for rx, rep in _SCRUB:
+        text = rx.sub(rep, text)
+    return text
