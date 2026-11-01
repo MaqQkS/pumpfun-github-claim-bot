@@ -361,6 +361,9 @@ from auto_research import AutoConfig, JobStore, AutoResearch
 AUTO = AutoResearch(AutoConfig.from_env(min_sol=MIN_FIRST_CLAIM_SOL), JobStore(os.path.join(DIR, "research", "data", "auto_jobs.sqlite3")),
                     CMDS, ALERTS)
 CMDS.auto_max_queue = AUTO.cfg.max_queue
+import webhook as _wh
+WEBHOOK = _wh.Producer.from_env()                 # Phase 7.1: off by default, fail-closed; separate research/webhook.env
+CMDS.on_auto_research = lambda job, res, pctx: _webhook_after_research(job, res, pctx)
 
 def tg_handle_update(u):
     """Runs on the poll thread: subscription changes inline (state only), everything else handed to CMDS workers."""
@@ -613,6 +616,21 @@ def _auto_after_alert(sig, kind, mint, lam, hits, cc, meta, origin):
         AUTO.on_alert(ev)
     except Exception as e: log.warning("auto research hook failed: %s", type(e).__name__)
 
+def _webhook_after_alert(sig, hits, cc, n_coins, meta, origin):
+    """Phase 7.1: enqueue claim.detected events AFTER the Telegram alert (non-blocking, never raises, no new API calls:
+    GitHub profile comes from the in-memory cache the alert already filled)."""
+    try:
+        if not WEBHOOK.cfg.active: return
+        f = (meta or {}).get("facts") or {}
+        WEBHOOK.on_claim(sig=sig, hits=hits, claim=cc, n_coins=n_coins, origin=origin, github=_gh.get(cc.get("user_id")),
+                         symbols={f.get("mint"): f.get("symbol")} if f.get("mint") else {}, market_cap=f.get("market_cap"))
+    except Exception as e: log.warning("webhook hook failed: %s", type(e).__name__)
+
+def _webhook_after_research(job, res, pctx):
+    if not WEBHOOK.cfg.active: return
+    WEBHOOK.on_auto_research(sig=job.key[1], mint=job.mint, res=res, facts=job.facts, pctx=pctx,
+                             scrub=tc.scrub_ai_text, split=tc._split_answer)
+
 def catchup_once():
     """Phase 6, CATCHUP_ENABLED only: bounded recovery of claims missed while the bot was down. Uses the normal
     detection path (handle_sig, origin='catchup'), oldest first, deduped by state['seen']; never auto-researched."""
@@ -668,6 +686,7 @@ def _handle_sig(sig, send=True, prefix="", origin="live"):
             meta = _alert_meta(cc, mint, sig, kind, hits, text) if send else None
             if send: tg_send_all(text, meta)
             if send: _auto_after_alert(sig, kind, mint, lam, hits, cc, meta, origin)
+            if send: _webhook_after_alert(sig, hits, cc, len(res), meta, origin)
     if send:
         state["seen"] = (state["seen"] + [sig])[-2000:]
     save_state(state)
@@ -721,6 +740,7 @@ def main():
     threading.Thread(target=authority_check_loop, daemon=True).start()
     tc.dd.HELIUS_GUARD[0] = CMDS._helius_guard    # research Helius reads (Queen's key): reserve in ledger first, fail closed; runtime only
     AUTO.recover()
+    log.info(WEBHOOK.describe()); WEBHOOK.start()
     log.info("auto research %s (chats=%d, max/day=%d, $%.2f/day) · catch-up %s", "ON" if AUTO.cfg.enabled else "off",
              len(AUTO.cfg.chats), AUTO.cfg.max_per_day, AUTO.cfg.daily_usd, "ON" if AUTO.cfg.catchup_enabled else "off")
     if AUTO.cfg.catchup_enabled: threading.Thread(target=catchup_once, daemon=True).start()

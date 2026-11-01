@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.0",
+  "event_id": "gc_research_d2e1a59e2fa6f1d237f44f1fff63b36d",
+  "event_type": "research.completed",
+  "emitted_at": "2025-11-01T03:00:50Z",
+  "chain": "solana",
+  "claim_event_id": "gc_claim_9dca3eb5aa8b3a783e669f2e400b661a",
+  "claim_tx_signature": "675ePaJEeYQ9zsvHvW62QH26RbxaiU8yUdV9weW1WXe3Jepg92Ti2XA26c81uBqzisaQdDdmEvCkaK5tHfYXJXBi",
+  "token": {
+    "mint": "9r33aA9jgEEhaSRzFVr7xa43MMaK7bJRcpjr5RyaAUnZ"
+  },
+  "verified": {
+    "source": "gitclaim_onchain",
+    "facts": {
+      "mint": "9r33aA9jgEEhaSRzFVr7xa43MMaK7bJRcpjr5RyaAUnZ",
+      "symbol": "$FFM",
+      "github_login": "NubsCarson",
+      "claim_sol": 5.52,
+      "claim_total_sol": 7.25,
+      "claim_coins": 2,
+      "claim_kind": "FIRST claim ever",
+      "tx_signature": "675ePaJEeYQ9zsvHvW62QH26RbxaiU8yUdV9weW1WXe3Jepg92Ti2XA26c81uBqzisaQdDdmEvCkaK5tHfYXJXBi",
+      "claim_time": "2025-11-01 03:00:00 UTC",
+      "signer_tags": [
+        "automated signer"
+      ]
+    }
+  },
+  "third_party": {
+    "label": "unverified data from the project's own pages / public APIs",
+    "website": "https://ffm.example.org",
+    "links": [
+      "https://x.com/ffm_example"
+    ],
+    "description": "An AI agent that finds you a date.",
+    "repos": [
+      {
+        "name": "ffm-agent",
+        "language": "TypeScript",
+        "stars": 3
+      }
+    ]
+  },
+  "ai_interpretation": {
+    "label": "AI-generated interpretation by Queen; not verified; not a trading recommendation or safety verdict",
+    "narrative": "FFM pitches an AI dating agent; the claimant's GitHub shows a TypeScript repo of the same name.",
+    "risk_verdict": "high risk (interpretation): tiny liquidity, new token.",
+    "key_findings": [
+      "- Liquidity ~$2.5k on PumpSwap",
+      "- Claimant account 1.9y old, 31 public repos"
+    ],
+    "tool_references": [
+      "token_info",
+      "github_user"
+    ],
+    "source_urls": [
+      "https://github.com/NubsCarson"
+    ]
+  },
+  "research": {
+    "model": "grok-4.3",
+    "reasoning_effort": "high",
+    "trigger": "auto",
+    "completed_at": "2025-11-01T03:00:50Z",
+    "duration_ms": 14100,
+    "cost_usd": 0.0213,
+    "cost_source": "measured",
+    "cached": false
+  }
+}

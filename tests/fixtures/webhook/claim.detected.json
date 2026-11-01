@@ -1,0 +1,53 @@
+{
+  "schema_version": "1.0",
+  "event_id": "gc_claim_9dca3eb5aa8b3a783e669f2e400b661a",
+  "event_type": "claim.detected",
+  "emitted_at": "2025-11-01T03:00:30Z",
+  "chain": "solana",
+  "origin": "live",
+  "verified": {
+    "source": "gitclaim_onchain",
+    "claim": {
+      "tx_signature": "675ePaJEeYQ9zsvHvW62QH26RbxaiU8yUdV9weW1WXe3Jepg92Ti2XA26c81uBqzisaQdDdmEvCkaK5tHfYXJXBi",
+      "classification": "FIRST",
+      "classification_detail": "FIRST claim ever",
+      "block_time": "2025-11-01T03:00:00Z",
+      "token_fee_share_lamports": 5520000000,
+      "token_fee_share_sol": 5.52,
+      "token_fee_share_attribution": "exact",
+      "vault_claim_total_lamports": 7250000000,
+      "vault_claim_total_sol": 7.25,
+      "vault_lifetime_lamports": 9000000000,
+      "coins_in_claim": 2,
+      "qualifying_coins_in_alert": 1,
+      "signer_classification": "automated_signer",
+      "signer_tags": [
+        "automated signer"
+      ],
+      "token_inferred": false
+    },
+    "token": {
+      "mint": "9r33aA9jgEEhaSRzFVr7xa43MMaK7bJRcpjr5RyaAUnZ"
+    },
+    "claimant": {
+      "role": "github_linked_fee_claimant",
+      "creator_relationship": "not_verified",
+      "github_user_id": "112233445",
+      "github_login": "NubsCarson",
+      "recipient_wallet": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+      "fee_vault": "2K8rxRJVf8Sih7C5c55ZbhoKFThQrpw6v3zULHARpump"
+    }
+  },
+  "third_party": {
+    "symbol": "FFM",
+    "symbol_source": "pump.fun / dexscreener at alert time",
+    "market_cap_display": "$56.3k"
+  },
+  "links": {
+    "solscan_tx": "https://solscan.io/tx/675ePaJEeYQ9zsvHvW62QH26RbxaiU8yUdV9weW1WXe3Jepg92Ti2XA26c81uBqzisaQdDdmEvCkaK5tHfYXJXBi",
+    "solscan_token": "https://solscan.io/token/9r33aA9jgEEhaSRzFVr7xa43MMaK7bJRcpjr5RyaAUnZ",
+    "pump_fun": "https://pump.fun/coin/9r33aA9jgEEhaSRzFVr7xa43MMaK7bJRcpjr5RyaAUnZ",
+    "dexscreener": "https://dexscreener.com/solana/9r33aA9jgEEhaSRzFVr7xa43MMaK7bJRcpjr5RyaAUnZ",
+    "github_profile": "https://github.com/NubsCarson"
+  }
+}

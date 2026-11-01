@@ -19,6 +19,7 @@ research/research.env
 .env.bak*
 *.env.bak*
 !research/research.env.example
+!research/webhook.env.example
 *.pem
 *.key
 id_rsa*

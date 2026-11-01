@@ -224,6 +224,7 @@ class CommandService:
         self._auto_q: deque = deque()                    # Phase 6: auto jobs wait here; manual _q always first
         self.auto_max_queue = auto_max_queue
         self.auto_calls = 0
+        self.on_auto_research = None                     # Phase 7.1 hook (job, res, pctx); publishes completed AUTO research only
         if durable_helius:                               # direct Helius reads on Queen's key: reserve first, fail closed
             dd.HELIUS_GUARD[0] = self._helius_guard
         self._reply_ctx = None
@@ -512,6 +513,11 @@ class CommandService:
             sent = bool(self.send_reply(job.chat, text, job.alert_msg_id)) if self.send_reply else False
         except Exception as e:
             log.warning("auto report send failed: %s", type(e).__name__)
+        if self.on_auto_research is not None:            # enqueue only (non-blocking); after the Telegram report
+            try:
+                self.on_auto_research(job, res, pctx)
+            except Exception as e:
+                log.warning("auto research webhook hook failed: %s", type(e).__name__)
         cost = (res.usage or {}).get("actual_usd")
         self._finish_auto(job, "completed" if sent else "undelivered",
                           f"cost={cost} cached={res.cached} ms={res.latency_ms}")
