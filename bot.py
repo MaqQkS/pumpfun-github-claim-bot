@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """pump.fun GitHub social-fee FIRST-claim alert bot."""
-import asyncio, html, re, base64, json, logging, os, struct, sys, threading, time
+import asyncio, collections, html, re, base64, json, logging, os, struct, sys, threading, time
 import base58, requests, websockets
 
 HELIUS = os.environ["HELIUS_API_KEY"]; TG = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -185,13 +185,83 @@ def compact(v):
     return f"${v:.0f}"
 
 _creator = {}
+_ATH_NOTE = {}                 # mint -> "gt" (approximate, GeckoTerminal) | "blocked" | "not_indexed" | "error"
+_PF = {"fail": 0, "fail_streak": 0, "blocked": False, "last_warn": 0.0}
+_GT_CACHE = {}                 # mint -> (expires, ath_usd or None)
+_GT_CALLS = collections.deque()
+GT = "https://api.geckoterminal.com/api/v2/networks/solana"
+GT_MAX_PER_MIN = 20            # GeckoTerminal free tier is ~30/min; stay well under
+
+def _pf_status(status, blocked):
+    """Log non-OK pump.fun responses with a running count; one WARNING when a block starts (then at most hourly)."""
+    _PF["fail"] += 1; _PF["fail_streak"] += 1
+    now = time.time()
+    if blocked and (not _PF["blocked"] or now - _PF["last_warn"] > 3600):
+        log.warning("pump.fun API blocked (HTTP %s, Cloudflare); ATH falls back to GeckoTerminal and the deployer "
+                    "(self-funded) flag is unavailable until it recovers [fail #%d]", status, _PF["fail"])
+        _PF["last_warn"] = now
+    elif not blocked:
+        log.info("pump.fun API non-OK: %s [fail #%d, streak %d]", status, _PF["fail"], _PF["fail_streak"])
+    _PF["blocked"] = blocked
+
+def _pf_ok():
+    if _PF["blocked"] or _PF["fail_streak"] >= 3:
+        log.info("pump.fun API recovered after %d failed calls", _PF["fail_streak"])
+    _PF["blocked"] = False; _PF["fail_streak"] = 0
+
+def _gt_get(path):
+    now = time.time()
+    while _GT_CALLS and now - _GT_CALLS[0] > 60: _GT_CALLS.popleft()
+    if len(_GT_CALLS) >= GT_MAX_PER_MIN: raise IOError("geckoterminal local rate limit")
+    _GT_CALLS.append(now)
+    r = requests.get(GT + path, timeout=6, headers={"Accept": "application/json"})
+    if r.status_code != 200: raise IOError(f"geckoterminal HTTP {r.status_code}")
+    return r.json()
+
+def gt_ath(mint):
+    """Approximate ATH market cap (USD) from GeckoTerminal's free API: top pool's highest hourly candle (daily if the
+    token is older than ~40 days) x supply. pump.fun mints use the fixed 1B supply; others use fdv/price from GT.
+    Returns (ath or None, note) where note is 'gt', 'not_indexed' or 'error'. Never raises."""
+    hit = _GT_CACHE.get(mint)
+    if hit and hit[0] > time.time(): return hit[1]
+    try:
+        pools = (_gt_get(f"/tokens/{mint}/pools?page=1") or {}).get("data") or []
+        if not pools: out = (None, "not_indexed")
+        else:
+            pool = pools[0]["attributes"]["address"]
+            if mint.endswith("pump"): supply = 1e9
+            else:
+                t = ((_gt_get(f"/tokens/{mint}") or {}).get("data") or {}).get("attributes") or {}
+                price, fdv = float(t.get("price_usd") or 0), float(t.get("fdv_usd") or 0)
+                supply = fdv / price if price > 0 and fdv > 0 else None
+            if not supply: out = (None, "not_indexed")
+            else:
+                c = ((_gt_get(f"/pools/{pool}/ohlcv/hour?aggregate=1&limit=1000&currency=usd&token=base") or {})
+                     .get("data") or {}).get("attributes", {}).get("ohlcv_list") or []
+                if len(c) >= 1000:
+                    c += ((_gt_get(f"/pools/{pool}/ohlcv/day?aggregate=1&limit=1000&currency=usd&token=base") or {})
+                          .get("data") or {}).get("attributes", {}).get("ohlcv_list") or []
+                highs = [float(x[2]) for x in c if len(x) > 2 and x[2]]
+                out = (max(highs) * supply, "gt") if highs else (None, "not_indexed")
+    except Exception as e:
+        log.info("geckoterminal ATH for %s failed: %s", mint[:8], str(e)[:80]); out = (None, "error")
+    _GT_CACHE[mint] = (time.time() + (600 if out[0] is not None else 120), out)
+    return out
+
 def coin_info(mint):
-    sym = mc = ath = None
+    sym = mc = ath = None; pf_blocked = pf_failed = False
     try:
         r = requests.get(f"https://frontend-api-v3.pump.fun/coins-v2/{mint}", timeout=10)
         if r.ok:
             d = r.json(); _creator[mint] = d.get("creator"); sym = d.get("symbol"); mc = d.get("usd_market_cap") or d.get("market_cap_usd"); ath = d.get("ath_market_cap")
-    except Exception as e: log.warning("pump api: %s", e)
+            _pf_ok()
+        else:
+            pf_failed = True
+            pf_blocked = r.status_code in (403, 429, 503) and ("cloudflare" in (r.headers.get("server") or "").lower()
+                                                             or r.status_code == 403 or "Just a moment" in (r.text or "")[:500])
+            _pf_status(r.status_code, pf_blocked)
+    except Exception as e:
+        pf_failed = True; log.warning("pump api: %s", e); _pf_status(type(e).__name__, False)
     if not sym or mc is None:
         try:
             p = requests.get(f"https://api.dexscreener.com/tokens/v1/solana/{mint}", timeout=10).json()
@@ -201,6 +271,13 @@ def coin_info(mint):
     if not sym:
         a = rpc("getAsset", {"id": mint})
         if a: sym = (a.get("content", {}).get("metadata") or {}).get("symbol")
+    _ATH_NOTE.pop(mint, None)
+    if ath is None:
+        g, note = gt_ath(mint) if mint else (None, "not_indexed")
+        if g is not None:
+            ath = max(g, mc or 0); _ATH_NOTE[mint] = "gt"
+        else:
+            _ATH_NOTE[mint] = "blocked" if pf_blocked else note if note == "not_indexed" else "error"
     return sym or "UNKNOWN", mc, ath
 
 E = html.escape
@@ -214,7 +291,11 @@ def _label(kind):
 
 def _token_block(sym, mint, mc, ath):
     ca = f"<code>{E(mint)}</code>" if mint else "(mint not resolved)"
-    athv = E(compact(ath)) if ath else "n/a"
+    note = _ATH_NOTE.get(mint)
+    if ath:
+        athv = f"~{E(compact(ath))} (GT)" if note == "gt" else E(compact(ath))
+    else:
+        athv = {"blocked": "n/a (pump.fun blocked)", "not_indexed": "n/a (not indexed)"}.get(note, "n/a")
     return f"${E(str(sym))}\n{ca}\n\n🧠 Token\n• MC: {E(compact(mc))} | ATH: {athv}"
 
 def _hdr(sym, mint, mc, ath):  # kept for compatibility
