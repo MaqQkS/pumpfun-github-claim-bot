@@ -490,7 +490,7 @@ class TestResearch(unittest.TestCase):
         """Real Phase 2 adapter with a $0 budget: refused before Queen is contacted."""
         from research.adapter import ResearchAdapter
         from research.config import load_settings
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             st = load_settings(environ={}, ledger_path=f"{d}/l.sqlite3", meter_path=f"{d}/m.jsonl", budget_daily_usd=0.0,
                                standard_url="http://127.0.0.1:9")
             a = ResearchAdapter(st)

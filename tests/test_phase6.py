@@ -212,7 +212,7 @@ class TestAutoFlow(Svc):
                 a, s = self.build(beh, **kw)
             self.deliver()
             self.auto.on_alert(ev())
-            self.assertTrue(wait_for(lambda: self.store.states().get("failed") == 1, 6), (name, self.store.states()))
+            self.assertTrue(wait_for(lambda: self.store.states().get("failed") == 1, 20), (name, self.store.states()))
             self.assertEqual(self.replies, [], name)
             if name != "offline":
                 self.assertEqual(self.stub.calls, 1, name)

@@ -15,6 +15,7 @@ case "$cfg" in *bot%s/*) printf '%%s' "$MOCK_OLD";; *bot%s/*) printf '%%s' "$MOC
 """ % (OLD, NEW)
 
 
+@unittest.skipUnless(__import__("shutil").which("bash"), "bash scripts are macOS-only")
 class TestRotate(unittest.TestCase):
     def run_script(self, old_code, new_code, token=NEW):
         d = Path(tempfile.mkdtemp())

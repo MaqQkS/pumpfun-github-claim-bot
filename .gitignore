@@ -22,3 +22,6 @@ research/research.env
 *.pem
 *.key
 id_rsa*
+
+logs/
+supervisor.log

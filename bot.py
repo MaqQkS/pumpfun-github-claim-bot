@@ -2,6 +2,7 @@
 """pump.fun GitHub social-fee FIRST-claim alert bot."""
 import asyncio, collections, html, re, base64, json, logging, os, struct, sys, threading, time
 import base58, requests, websockets
+import lifecycle as _lc
 
 HELIUS = os.environ["HELIUS_API_KEY"]; TG = os.environ["TELEGRAM_BOT_TOKEN"]
 RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS}"
@@ -804,7 +805,19 @@ def main():
     AUTO.recover()
     log.info("auto research %s (chats=%d, max/day=%d, $%.2f/day) · catch-up %s", "ON" if AUTO.cfg.enabled else "off",
              len(AUTO.cfg.chats), AUTO.cfg.max_per_day, AUTO.cfg.daily_usd, "ON" if AUTO.cfg.catchup_enabled else "off")
+    log.info(_lc.startup_line(DIR, AUTO.cfg.enabled, AUTO.cfg.catchup_enabled, len(CMDS.cfg.testers),
+                              len(CMDS.cfg.chats), CMDS.cfg.enabled))
+    _lc.install_signals(log)
     if AUTO.cfg.catchup_enabled: threading.Thread(target=catchup_once, daemon=True).start()
-    asyncio.run(ws_loop())
+    try:
+        asyncio.run(ws_loop())
+    except KeyboardInterrupt:
+        _lc.REASON[0] = "SIGINT"
+    except BaseException as e:
+        _lc.REASON[0] = f"exception:{type(e).__name__}"
+        log.exception("bot crashed")
+        raise
+    finally:
+        if not _lc.logged[0]: log.info(_lc.stop_line()); _lc.logged[0] = True
 
 if __name__ == "__main__": main()

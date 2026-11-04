@@ -218,6 +218,7 @@ class TestCoalesceReal(Base):
         self.assertAlmostEqual(b.totals()["usd_total"], t1["usd_total"]); self.assertEqual(b.totals()["requests"], 1)
 
 
+@unittest.skipUnless(__import__("shutil").which("bash"), "bash scripts are macOS-only")
 class TestQueenSupervisor(unittest.TestCase):
     def test_supervisor_restarts_dummy_bounded(self):
         d = tempfile.mkdtemp()

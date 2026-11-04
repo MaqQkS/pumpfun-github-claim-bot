@@ -1,3 +1,4 @@
 websockets
 requests
 base58
+tzdata; sys_platform == "win32"
