@@ -244,9 +244,11 @@ class TestService(unittest.TestCase):
         run(s, "/re", alert_msg(forward_origin={"type": "user"}))
         self.assertTrue(wait_for(lambda: sent)); self.assertEqual(ad.calls, []); self.assertIn("isn't to a GitClaim alert", sent[0][1])
 
-    def test_any_user_can_research_reply(self):
+    def test_non_tester_reply_ignored_tester_allowed(self):
         ad = FakeAdapter(); s, sent = svc(adapter=ad)
-        self.assertTrue(run(s, "/re", alert_msg(), user=STRANGER))
+        self.assertFalse(run(s, "/re", alert_msg(), user=STRANGER)); time.sleep(0.1)
+        self.assertEqual(sent, []); self.assertEqual(ad.calls, [])
+        self.assertTrue(run(s, "/re", alert_msg()))
         self.assertTrue(wait_for(lambda: any("AI take" in t for _, t in sent)))
         self.assertEqual(len(ad.calls), 1)
 

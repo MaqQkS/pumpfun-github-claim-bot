@@ -118,9 +118,19 @@ def parse_command(text: str | None, bot_username: str | None) -> Parsed | None:
 
 
 # ---- config ------------------------------------------------------------------------------------
+def _ids(v: str) -> frozenset:
+    out = set()
+    for x in (v or "").replace(" ", "").split(","):
+        if x.lstrip("-").isdigit():
+            out.add(int(x))
+    return frozenset(out)
+
+
 @dataclass(frozen=True)
 class CmdConfig:
     enabled: bool = False                                   # RESEARCH_COMMANDS_ENABLED (master switch)
+    testers: frozenset = frozenset({2038104261})            # RESEARCH_TESTER_IDS (Bala; add Jed when confirmed)
+    chats: frozenset = frozenset({-5178862838, 2038104261}) # RESEARCH_CHAT_IDS (Queen Harness Tests + Bala DM)
     max_queue: int = 3                                      # research jobs waiting behind the running one
     direct_workers: int = 2
 
@@ -135,6 +145,8 @@ class CmdConfig:
             env.update({k: v for k, v in os.environ.items() if k.startswith("RESEARCH_")})
         d = cls()
         return cls(enabled=env.get("RESEARCH_COMMANDS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"),
+                   testers=_ids(env["RESEARCH_TESTER_IDS"]) if env.get("RESEARCH_TESTER_IDS") else d.testers,
+                   chats=_ids(env["RESEARCH_CHAT_IDS"]) if env.get("RESEARCH_CHAT_IDS") else d.chats,
                    max_queue=int(env.get("RESEARCH_MAX_QUEUE", d.max_queue)))
 
 
@@ -260,15 +272,14 @@ class CommandService:
 
     # access ---------------------------------------------------------------
     def allowed(self, chat_id, user_id) -> bool:
-        """Commands are public in every chat; only the global switch can disable them."""
-        return self.cfg.enabled
+        return self.cfg.enabled and chat_id in self.cfg.chats and user_id in self.cfg.testers
 
     # entry point from the poll thread: must not block -----------------------
     def handle(self, chat_id: int, user_id: int | None, p: Parsed, t_recv: float | None = None, reply=None) -> bool:
         """Returns True when the command was accepted (reply will follow), False when ignored.
         `reply` is an alert_map.Resolution when the command replied to a message (Phase 4), else None."""
         if not self.allowed(chat_id, user_id):
-            log.info("cmd /%s ignored (chat=%s user=%s commands disabled)", p.name, chat_id, user_id)
+            log.info("cmd /%s ignored (chat=%s user=%s not allowlisted or commands disabled)", p.name, chat_id, user_id)
             return False
         self._reply_ctx = None                  # only read synchronously on the poll thread (captured for /gh)
         if reply is not None and p.known and not p.deep and p.name in REPLY_COMMANDS and not _explicit_target(p):

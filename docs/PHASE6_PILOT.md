@@ -12,10 +12,10 @@ AUTO_RESEARCH_DAILY_USD=0.15
 AUTO_RESEARCH_DAILY_HELIUS_CREDITS=1000
 CATCHUP_ENABLED=false
 ```
-Manual commands are now open to everyone (see TESTERS.md). Unchanged: global caps
+Unchanged: `RESEARCH_TESTER_IDS=2038104261`, `RESEARCH_CHAT_IDS=-5178862838,2038104261`, global caps
 `RESEARCH_BUDGET_TOTAL_USD=5.00`, `RESEARCH_BUDGET_DAILY_USD=5.00`, `RESEARCH_HELIUS_DAILY_CREDITS=4000`,
 `RESEARCH_HELIUS_TOTAL_CREDITS=100000`. Model is grok-4.3, low reasoning (the standard Queen on :8790). Auto never uses deep/grok-4.7.
-Automatic research destinations and subscribers are unchanged.
+No new testers or subscribers.
 
 ## Scope (what the code enforces)
 - Only chat -5178862838 (Queen Harness Tests). Alerts to other subscribers never trigger research.

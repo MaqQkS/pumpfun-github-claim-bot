@@ -1,7 +1,7 @@
 # Phase 4: reply-to-alert research
 
 Reply `/re` `/research` `/ho` `/holders` `/gh` `/github` `/liq` `/liquidity` (optionally `@GitClaimed_bot`) to a GitClaim
-claim alert. An explicit argument (`/re <CA>`, `/gh <login>`) always wins over the reply. Commands are now open to every user and chat when enabled (see TESTERS.md).
+claim alert. An explicit argument (`/re <CA>`, `/gh <login>`) always wins over the reply. Testers/chats allowlists unchanged.
 
 ## How a reply is resolved (`alert_map.py`)
 1. Accept only if `reply_to_message.from.id` == our bot id (from getMe) and `is_bot`, same chat, and none of
@@ -32,7 +32,8 @@ Reuse: `/re` uses stored ClaimFacts (no bot.log scan); `/gh` uses stored GitHub 
 Scope the menu to the private group only, never default scope:
 `setMyCommands {"commands":[{"command":"re","description":"AI research (reply to an alert)"},…],
 "scope":{"type":"chat","chat_id":-5178862838}}` and optionally `{"type":"chat_member","chat_id":-5178862838,
-"user_id":2038104261}`. Remove with `deleteMyCommands` using the same scope. The menu is cosmetic; commands are available to everyone when enabled.
+"user_id":2038104261}`. Remove with `deleteMyCommands` using the same scope. Non-testers would still be refused by the
+allowlist; the menu is cosmetic.
 
 ## Token rotation (before deployment)
 1. BotFather -> /mybots -> @GitClaimed_bot -> API Token -> Revoke current token. Copy the new token (never paste it in chat).
