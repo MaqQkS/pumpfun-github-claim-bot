@@ -587,7 +587,7 @@ def _alert_meta(cc, mint, sig, kind, hits, text):
         facts = parse_alerts(time.strftime("%Y-%m-%d %H:%M:%S") + ",000 INFO ALERT\n" + text)
         f = facts[0].as_data() if facts and mint and facts[0].mint == mint else None
         if f: f["claim_time"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-        return {"mints": mints, "sig": sig, "kind": kind, "github_ids": [str(cc.get("user_id"))] if cc.get("user_id") else [],
+        return {"mints": mints, "primary_mint": mint, "sig": sig, "kind": kind, "github_ids": [str(cc.get("user_id"))] if cc.get("user_id") else [],
                 "facts": f, "recorded": time.time()}
     except Exception as e:
         log.warning("alert meta failed: %s", type(e).__name__); return None

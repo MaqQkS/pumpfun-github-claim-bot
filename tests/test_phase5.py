@@ -123,7 +123,7 @@ class TestReplyCases(unittest.TestCase):
     def test_E_multi(self):
         s, sent = self._svc()
         send(s, "/liq", reply=am.resolve_reply(cmd_msg("/liq", alert_msg("multi")), BOT_ID, amap()))
-        self.assertTrue(wait_for(lambda: sent)); self.assertIn("/liq " + MULTI[2], sent[0][1])
+        self.assertTrue(wait_for(lambda: sent)); self.assertIn(tc._short(MULTI[0]), sent[0][1]); self.assertNotIn("Which one?", sent[0][1])
 
     def test_F_unresolved_mint(self):
         h = FIX["single"].replace(f"<code>{SINGLE_MINT}</code>", "(mint not resolved)").replace(SINGLE_MINT, "x")
@@ -188,7 +188,7 @@ class TestCoalesceReal(Base):
     def test_same_token_two_chats_one_paid_call(self):
         a = self.make(lambda n: (200, ok_body(), 0.3, "grok-4.3"))
         s, sent = svc(adapter=a, http=FakeHTTP({"dexscreener": Resp(200, DEX)}))
-        s.cfg = tc.CmdConfig(enabled=True, testers=frozenset({BALA, 7}), chats=frozenset({GROUP, BALA}))
+        s.cfg = tc.CmdConfig(enabled=True)
         send(s, f"/re {FFM}", chat=GROUP); send(s, f"/re {FFM}", chat=BALA, user=BALA); send(s, f"/re {FFM}", chat=GROUP, user=7)
         self.assertTrue(wait_for(lambda: sum("AI take" in t for _, t in sent) >= 2, 8), sent)
         self.assertEqual(self.stub.calls, 1)
@@ -242,22 +242,23 @@ class TestHelius(unittest.TestCase):
         self.assertTrue(wait_for(lambda: sent)); self.assertIn("Helius", sent[0][1]); self.assertNotIn("api-key", sent[0][1])
 
 
-class TestTesters(unittest.TestCase):
-    def test_adding_tester_is_config_only(self):
+class TestPublicAccess(unittest.TestCase):
+    def test_legacy_access_settings_do_not_change_subscribers(self):
         st_before = json.dumps({"subscribers": [1, 2]})
         c = tc.CmdConfig.from_env(env={"RESEARCH_COMMANDS_ENABLED": "true", "RESEARCH_TESTER_IDS": "2038104261,123",
                                        "RESEARCH_CHAT_IDS": "-5178862838,2038104261"})
-        self.assertEqual(c.testers, frozenset({2038104261, 123}))
+        self.assertTrue(tc.CommandService(c, lambda *_: None).allowed(-1009, 555))
         import inspect
         src = inspect.getsource(tc)
         self.assertNotIn("state.json", src); self.assertNotIn("subscribers\"].append", src)
         self.assertEqual(st_before, json.dumps({"subscribers": [1, 2]}))
 
-    def test_user_and_chat_both_required(self):
-        c = tc.CmdConfig(enabled=True, testers=frozenset({BALA, 123}), chats=frozenset({GROUP}))
-        s = tc.CommandService(c, lambda *_: None)
-        self.assertTrue(s.allowed(GROUP, 123)); self.assertFalse(s.allowed(-1009, 123)); self.assertFalse(s.allowed(GROUP, 555))
-        self.assertFalse(tc.CommandService(tc.CmdConfig(enabled=False, testers=c.testers, chats=c.chats), lambda *_: None).allowed(GROUP, BALA))
+    def test_all_users_and_chats_can_access_commands(self):
+        s = tc.CommandService(tc.CmdConfig(enabled=True), lambda *_: None)
+        for chat, user in ((GROUP, 123), (-1009, 123), (GROUP, 555), (-1009, None)):
+            self.assertTrue(s.allowed(chat, user))
+            disabled = tc.CommandService(tc.CmdConfig(enabled=False), lambda *_: None)
+            self.assertFalse(disabled.allowed(chat, user))
 
 
 if __name__ == "__main__":

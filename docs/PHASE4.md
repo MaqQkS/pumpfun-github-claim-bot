@@ -1,7 +1,7 @@
 # Phase 4: reply-to-alert research
 
 Reply `/re` `/research` `/ho` `/holders` `/gh` `/github` `/liq` `/liquidity` (optionally `@GitClaimed_bot`) to a GitClaim
-claim alert. An explicit argument (`/re <CA>`, `/gh <login>`) always wins over the reply. Testers/chats allowlists unchanged.
+claim alert. An explicit argument (`/re <CA>`, `/gh <login>`) always wins over the reply. Commands are now open to every user and chat when enabled (see TESTERS.md).
 
 ## How a reply is resolved (`alert_map.py`)
 1. Accept only if `reply_to_message.from.id` == our bot id (from getMe) and `is_bot`, same chat, and none of
@@ -16,7 +16,11 @@ claim alert. An explicit argument (`/re <CA>`, `/gh <login>`) always wins over t
    whole token-block line or the tail of a `• $SYM …` "Also first claims" line; each must base58-decode to 32 bytes
    (case kept). Claim tx from the `solscan.io/tx/` text_link. The parsed result is a mint only; `/re` then uses
    GitClaim's own log record for that mint if one exists (same as `/re <CA>`), and labels the source.
-4. >1 distinct mint -> "That alert lists N tokens. Which one?" with `/re <CA>` lines. None -> ask for a CA.
+4. Reply commands default to the headline token, even when "Also first claims" lists other tokens.
+   New mappings record `primary_mint`; older mappings use the primary claim facts or the CA directly below
+   the token-bearing alert header. Unmapped historical alerts use that same header layout. Explicit command
+   arguments still override the reply. Multiple tokens with no identifiable headline still prompt for a choice;
+   no token found asks for a CA.
 
 Output labels: `📎 From the replied-to alert (GitClaim's stored record)` or
 `📎 Older alert: CA read from the alert message; claim facts from GitClaim's own log | unavailable (not verified)`.
@@ -28,8 +32,7 @@ Reuse: `/re` uses stored ClaimFacts (no bot.log scan); `/gh` uses stored GitHub 
 Scope the menu to the private group only, never default scope:
 `setMyCommands {"commands":[{"command":"re","description":"AI research (reply to an alert)"},…],
 "scope":{"type":"chat","chat_id":-5178862838}}` and optionally `{"type":"chat_member","chat_id":-5178862838,
-"user_id":2038104261}`. Remove with `deleteMyCommands` using the same scope. Non-testers would still be refused by the
-allowlist; the menu is cosmetic.
+"user_id":2038104261}`. Remove with `deleteMyCommands` using the same scope. The menu is cosmetic; commands are available to everyone when enabled.
 
 ## Token rotation (before deployment)
 1. BotFather -> /mybots -> @GitClaimed_bot -> API Token -> Revoke current token. Copy the new token (never paste it in chat).

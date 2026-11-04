@@ -20,14 +20,15 @@ alerts keep flowing.
 - Bot username: `TELEGRAM_BOT_USERNAME` env, else one `getMe` call when polling starts.
 
 ## Commands
-Operational (testers only): `/help /h`, `/status /st`, `/liquidity /liq`, `/holders /ho`, `/github /gh`, `/research /re` (grok-4.3 low).
+Operational (everyone): `/help /h`, `/status /st`, `/liquidity /liq`, `/holders /ho`, `/github /gh`, `/research /re` (grok-4.3 low).
 Coming soon (reply with reason, no AI): nar, dev, wa, risk/rk, bu, sn, soc, za, cmp, hist, chg, fund, la/ln, cl, sr, q, src.
 `/d re|dev|wa <CA>`: replies "deep mode disabled", no AI call. `/d` on a no-AI command runs it normally with a note.
 
 ## Access
-`RESEARCH_COMMANDS_ENABLED` (default false), `RESEARCH_TESTER_IDS` (default 2038104261), `RESEARCH_CHAT_IDS`
-(default -5178862838 Queen Harness Tests, 2038104261 Bala DM). Set in process env or `research/research.env`.
-Both chat AND user must be allowlisted; anyone else gets no reply. Replies go only to the requesting chat.
+`RESEARCH_COMMANDS_ENABLED` (default false) is the global command switch. Set it in the process
+environment or `research/research.env`. When enabled, every user and chat can use commands.
+Legacy `RESEARCH_TESTER_IDS` and `RESEARCH_CHAT_IDS` are ignored. Replies go only to the requesting chat.
+Budget and queue limits still apply; automatic research destinations are configured separately.
 
 ## Concurrency
 The poll thread only parses, checks access and enqueues. Direct commands run on a 2-thread pool (max 10 pending).

@@ -132,9 +132,45 @@ class TestResolve(unittest.TestCase):
                "entities": [{"type": "code", "offset": 7, "length": 44}]}
         self.assertIn("isn't a GitClaim claim alert", am.resolve_reply(cmd_msg("/re", rep), BOT_ID, amap()).error)
 
-    def test_multi_asks(self):
-        r = am.resolve_reply(cmd_msg("/re", alert_msg("multi")), BOT_ID, amap())
-        self.assertEqual(r.error, "multi"); self.assertEqual(r.choices, MULTI)
+    def test_multi_uses_headline_mint(self):
+        rep = alert_msg("multi", date=int(time.time()) - 3 * 3600)
+        rep["entities"].reverse()  # selection follows the layout, not entity order
+        r = am.resolve_reply(cmd_msg("/re", rep), BOT_ID, amap())
+        self.assertIsNone(r.error); self.assertEqual(r.mint, MULTI[0])
+        self.assertEqual(r.meta, {})  # parsing never creates verified claim facts
+
+    def test_multi_stored_primary_survives_restart(self):
+        for meta in ({"primary_mint": MULTI[0]}, {"facts": {"mint": MULTI[0]}}, {}):
+            with self.subTest(meta=meta):
+                a = amap()
+                a.record(GROUP, 500, list(reversed(MULTI)), "SIG", meta)
+                r = am.resolve_reply(cmd_msg("/liq", alert_msg("multi")), BOT_ID, am.AlertMap(a.path))
+                self.assertEqual((r.mint, r.source, r.meta), (MULTI[0], "stored", meta))
+
+    def test_ambiguous_alert_without_headline_still_asks(self):
+        h = FIX["multi"].replace(" · $Q", "\n$Q")
+        text, ents = tg_render(h)
+        rep = alert_msg("multi", text=text, entities=ents)
+        for stored in (False, True):
+            a = amap()
+            if stored:
+                a.record(GROUP, 500, MULTI, "SIG")
+            r = am.resolve_reply(cmd_msg("/liq", rep), BOT_ID, a)
+            self.assertEqual(r.error, "multi"); self.assertEqual(r.choices, MULTI)
+
+    def test_screenshot_epyh_headline(self):
+        primary = "Gfw1Kbpoe3kuLwGCcPcrnLttrbEtyYDmWmVKJHGCpump"
+        secondary = "HJrTsHqBwYB9Ck2jACcar84xqrvDGKRMLYYGdMVEpump"
+        h = (f"🆕 FIRST CLAIM · $EPYH\n<code>{primary}</code>\n\n💸 Claim: 1.04 SOL by lalune"
+             f"\n\n➕ Also first claims:\n• $EPYH 0.36 SOL · <code>{secondary}</code>")
+        text, ents = tg_render(h)
+        rep = alert_msg(text=text, entities=ents, date=int(time.time()) - 3 * 3600)
+        for stored in (False, True):
+            a = amap()
+            if stored:
+                a.record(GROUP, 500, [primary, secondary], "SIG")
+            r = am.resolve_reply(cmd_msg("/liq", rep), BOT_ID, a)
+            self.assertEqual(r.mint, primary); self.assertIsNone(r.error)
 
 
 def run(s, text, rep, user=BALA, chat=GROUP, a=None):
@@ -188,20 +224,35 @@ class TestService(unittest.TestCase):
             dd.github_user = orig
         self.assertEqual(seen, ["4242"])
 
-    def test_multi_token_reply_asks(self):
+    def test_multi_token_reply_researches_primary(self):
         ad = FakeAdapter(); s, sent = svc(adapter=ad)
         run(s, "/re", alert_msg("multi"))
-        self.assertTrue(wait_for(lambda: sent)); self.assertIn("lists 3 tokens", sent[0][1]); self.assertEqual(ad.calls, [])
-        self.assertIn(f"/re {MULTI[1]}", sent[0][1])
+        self.assertTrue(wait_for(lambda: ad.calls)); self.assertIn(MULTI[0], ad.calls[0][0])
+
+    def test_multi_reply_direct_commands_and_explicit_override(self):
+        for command, handler in (("liq", "liquidity"), ("ho", "holders"), ("gh", "github")):
+            for explicit in (False, True):
+                with self.subTest(command=command, explicit=explicit):
+                    s, sent = svc()
+                    setattr(s, "_cmd_" + handler, lambda args, *rest: args[0])
+                    run(s, "/" + command + (" " + MULTI[1] if explicit else ""), alert_msg("multi"))
+                    self.assertTrue(wait_for(lambda: sent))
+                    self.assertEqual(sent[0][1], MULTI[1] if explicit else MULTI[0])
 
     def test_rejected_reply_no_llm(self):
         ad = FakeAdapter(); s, sent = svc(adapter=ad)
         run(s, "/re", alert_msg(forward_origin={"type": "user"}))
         self.assertTrue(wait_for(lambda: sent)); self.assertEqual(ad.calls, []); self.assertIn("isn't to a GitClaim alert", sent[0][1])
 
-    def test_not_allowlisted_reply_ignored(self):
+    def test_any_user_can_research_reply(self):
         ad = FakeAdapter(); s, sent = svc(adapter=ad)
-        self.assertFalse(run(s, "/re", alert_msg(), user=STRANGER)); time.sleep(0.1)
+        self.assertTrue(run(s, "/re", alert_msg(), user=STRANGER))
+        self.assertTrue(wait_for(lambda: any("AI take" in t for _, t in sent)))
+        self.assertEqual(len(ad.calls), 1)
+
+    def test_disabled_reply_ignored(self):
+        ad = FakeAdapter(); s, sent = svc(adapter=ad, enabled=False)
+        self.assertFalse(run(s, "/re", alert_msg(), user=STRANGER))
         self.assertEqual(sent, []); self.assertEqual(ad.calls, [])
 
     def test_parsed_older_alert_labels_missing_facts(self):
@@ -235,6 +286,13 @@ class TestService(unittest.TestCase):
 
 
 class TestAlertUnchanged(unittest.TestCase):
+    def test_metadata_records_primary_mint(self):
+        import bot
+        hits = [("FIRST claim ever", m, 1_000_000_000) for m in MULTI]
+        meta = bot._alert_meta({"user_id": 123}, MULTI[0], "SIG", "FIRST claim ever", hits, FIX["multi"])
+        self.assertEqual(meta["primary_mint"], MULTI[0])
+        self.assertEqual(meta["mints"], MULTI)
+
     def test_send_text_unchanged_and_mapping_recorded(self):
         import bot
         posted = []

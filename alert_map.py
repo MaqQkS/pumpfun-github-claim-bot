@@ -115,14 +115,17 @@ def _line_of(text: str, ent: dict) -> str:
 
 
 def parse_alert_message(text: str | None, entities: list | None) -> dict:
-    """-> {"is_alert": bool, "mints": [...], "sig": str|None}. Mints come from `code` entities in the two places the
-    alert layout puts a CA: a token-block line that is exactly the CA, or an '• $SYM … <code>CA</code>' extra line."""
+    """Return is_alert, mints, sig, and primary_mint (the CA below the token-bearing header).
+    Mints come from `code` entities in the two places the alert layout puts a CA:
+    a token-block line that is exactly the CA, or an '• $SYM … <code>CA</code>' extra line."""
     text, entities = text or "", entities or []
     head = text.lstrip().split("\n", 1)[0]
     is_alert = head.startswith(ALERT_HEADS) and "💸 Claim:" in text
-    mints, sig = [], None
+    mints, sig, primary = [], None, None
+    lines = text.lstrip().splitlines()
+    headline_mint = lines[1].strip() if len(lines) > 1 and " · $" in head else None
     if not is_alert:
-        return {"is_alert": False, "mints": [], "sig": None}
+        return {"is_alert": False, "mints": [], "sig": None, "primary_mint": None}
     for e in entities:
         t = e.get("type")
         if t == "code":
@@ -130,13 +133,15 @@ def parse_alert_message(text: str | None, entities: list | None) -> dict:
             line = _line_of(text, e).strip()
             if b58_32(v) and (line == v or (line.startswith("• $") and line.endswith(v))):
                 mints.append(v)
+                if v == headline_mint:
+                    primary = v
         elif t == "text_link" and sig is None:
             url = e.get("url") or ""
             if url.startswith("https://solscan.io/tx/"):
                 cand = url[len("https://solscan.io/tx/"):]
                 if 64 <= len(cand) <= 90 and all(ch in _B58I for ch in cand):
                     sig = cand
-    return {"is_alert": True, "mints": list(dict.fromkeys(mints)), "sig": sig}
+    return {"is_alert": True, "mints": list(dict.fromkeys(mints)), "sig": sig, "primary_mint": primary}
 
 
 # ---- reply resolution --------------------------------------------------------------------------
@@ -167,6 +172,13 @@ def resolve_reply(msg: dict, bot_id: int | None, amap: AlertMap | None) -> Resol
     rec = amap.get(chat, rep.get("message_id")) if amap and rep.get("message_id") is not None else None
     if rec and rec["mints"]:
         if len(rec["mints"]) > 1:
+            # New records name the primary explicitly. Older records carry its facts;
+            # if those are unavailable, recover the headline CA from the original layout.
+            primary = rec["meta"].get("primary_mint") or (rec["meta"].get("facts") or {}).get("mint")
+            if primary not in rec["mints"]:
+                primary = parse_alert_message(rep.get("text"), rep.get("entities"))["primary_mint"]
+            if primary in rec["mints"]:
+                return Resolution(mint=primary, source="stored", sig=rec["sig"], meta=rec["meta"])
             return Resolution(source="stored", sig=rec["sig"], choices=rec["mints"], error="multi")
         return Resolution(mint=rec["mints"][0], source="stored", sig=rec["sig"], meta=rec["meta"])
     p = parse_alert_message(rep.get("text"), rep.get("entities"))
@@ -174,6 +186,8 @@ def resolve_reply(msg: dict, bot_id: int | None, amap: AlertMap | None) -> Resol
         return Resolution(error="That message isn't a GitClaim claim alert. Send a CA: <code>/re &lt;CA&gt;</code>.")
     if not p["mints"]:
         return Resolution(error="No token CA found in that alert (mint not resolved). Send a CA: <code>/re &lt;CA&gt;</code>.")
+    if p["primary_mint"]:
+        return Resolution(mint=p["primary_mint"], source="parsed", sig=p["sig"])
     if len(p["mints"]) > 1:
         return Resolution(source="parsed", sig=p["sig"], choices=p["mints"], error="multi")
     return Resolution(mint=p["mints"][0], source="parsed", sig=p["sig"])

@@ -227,10 +227,9 @@ class TestAccess(unittest.TestCase):
     def test_kill_switch_default_off(self):
         self.assertFalse(tc.CmdConfig.from_env({}).enabled)
         c = tc.CmdConfig.from_env({"RESEARCH_COMMANDS_ENABLED": "true", "RESEARCH_TESTER_IDS": "1,2", "RESEARCH_CHAT_IDS": "-5,1"})
-        self.assertEqual((c.enabled, c.testers, c.chats), (True, frozenset({1, 2}), frozenset({-5, 1})))
-        d = tc.CmdConfig.from_env({})
-        self.assertEqual(d.testers, frozenset({BALA}))
-        self.assertEqual(d.chats, frozenset({GROUP, BALA}))
+        self.assertTrue(c.enabled)
+        service = tc.CommandService(c, lambda *_: None)
+        self.assertTrue(service.allowed(OTHER_CHAT, STRANGER))  # obsolete ID settings are ignored
         s, sent = svc(enabled=False)
         self.assertFalse(s.handle(GROUP, BALA, P("/h")))
         time.sleep(0.05); self.assertEqual(sent, [])
@@ -241,22 +240,21 @@ class TestAccess(unittest.TestCase):
         saved = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("RESEARCH_COMMANDS")}
         try:
             c = tc.CmdConfig.from_env(env_file=f.name)
-            self.assertTrue(c.enabled); self.assertEqual(c.testers, frozenset({BALA, 7}))
+            self.assertTrue(c.enabled)
             os.environ["RESEARCH_COMMANDS_ENABLED"] = "false"
             self.assertFalse(tc.CmdConfig.from_env(env_file=f.name).enabled)
         finally:
             os.environ.pop("RESEARCH_COMMANDS_ENABLED", None); os.environ.update(saved); os.unlink(f.name)
 
-    def test_allowlist(self):
-        s, sent = svc()
-        self.assertFalse(s.handle(GROUP, STRANGER, P("/h")))          # non-tester in test group
-        self.assertFalse(s.handle(OTHER_CHAT, BALA, P("/h")))         # tester in another chat
-        self.assertFalse(s.handle(STRANGER, STRANGER, P("/h")))       # stranger DM
-        time.sleep(0.05); self.assertEqual(sent, [])
-        self.assertTrue(s.handle(GROUP, BALA, P("/h")))
-        self.assertTrue(s.handle(BALA, BALA, P("/st")))
-        self.assertTrue(wait_for(lambda: len(sent) == 2))
-        self.assertEqual({c for c, _ in sent}, {GROUP, BALA})
+    def test_commands_open_to_everyone(self):
+        for chat, user in ((GROUP, STRANGER), (OTHER_CHAT, BALA), (STRANGER, STRANGER),
+                           (GROUP, None), (BALA, BALA)):
+            with self.subTest(chat=chat, user=user):
+                s, sent = svc()
+                self.assertTrue(s.handle(chat, user, P("/h")))
+                self.assertTrue(wait_for(lambda: len(sent) == 1))
+                self.assertEqual(sent[0][0], chat)
+                self.assertIn("GitClaim commands", sent[0][1])
 
     def test_replies_never_broadcast(self):
         bot.state["subscribers"] = [BALA, GROUP, 42]
