@@ -133,6 +133,7 @@ class CmdConfig:
     chats: frozenset = frozenset({-5178862838, 2038104261}) # RESEARCH_CHAT_IDS (Queen Harness Tests + Bala DM)
     max_queue: int = 3                                      # research jobs waiting behind the running one
     direct_workers: int = 2
+    deep_enabled: bool = False                              # RESEARCH_DEEP_ENABLED (/d re); default off for tests
 
     @classmethod
     def from_env(cls, env=None, env_file=None):
@@ -144,10 +145,12 @@ class CmdConfig:
                    if k.startswith("RESEARCH_")}
             env.update({k: v for k, v in os.environ.items() if k.startswith("RESEARCH_")})
         d = cls()
-        return cls(enabled=env.get("RESEARCH_COMMANDS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"),
+        _on = ("1", "true", "yes", "on")
+        return cls(enabled=env.get("RESEARCH_COMMANDS_ENABLED", "false").strip().lower() in _on,
                    testers=_ids(env["RESEARCH_TESTER_IDS"]) if env.get("RESEARCH_TESTER_IDS") else d.testers,
                    chats=_ids(env["RESEARCH_CHAT_IDS"]) if env.get("RESEARCH_CHAT_IDS") else d.chats,
-                   max_queue=int(env.get("RESEARCH_MAX_QUEUE", d.max_queue)))
+                   max_queue=int(env.get("RESEARCH_MAX_QUEUE", d.max_queue)),
+                   deep_enabled=env.get("RESEARCH_DEEP_ENABLED", "false").strip().lower() in _on)
 
 
 # ---- bot context (what the commands may read from GitClaim) -----------------------------------
@@ -318,12 +321,7 @@ class CommandService:
 
     def _dispatch(self, chat, p: Parsed, key) -> bool:
         if p.name == DEEP and p.deep and not p.args:
-            deep_on = False
-            try:
-                from research.config import load_settings as _ls
-                deep_on = bool(_ls().deep_enabled)
-            except Exception:
-                deep_on = False
+            deep_on = bool(self.cfg.deep_enabled)
             tip = ("Use <code>/d re &lt;CA&gt;</code> for deep research (grok-4.7). "
                    "<code>/d dev</code> and <code>/d wa</code> are coming soon.") if deep_on else (
                    "Use <code>/d re|dev|wa &lt;CA&gt;</code>. Deep mode (grok-4.7) is disabled for now.")
@@ -336,24 +334,14 @@ class CommandService:
             return True
         if p.deep and spec.ai:
             if spec.name == "research":
-                deep_on = False
-                try:
-                    from research.config import load_settings as _ls
-                    deep_on = bool(_ls().deep_enabled)
-                except Exception:
-                    deep_on = False
+                deep_on = bool(self.cfg.deep_enabled)
                 if not deep_on:
                     self._done(key)
                     self._submit_direct(key, lambda: "ℹ️ Deep mode (grok-4.7) is disabled for now; no AI call was made. Use <code>/re &lt;CA&gt;</code> for standard research.", chat)
                     return True
                 return self._enqueue_research(chat, p, key)
             if spec.name in DEEP_CAPABLE:
-                deep_on = False
-                try:
-                    from research.config import load_settings as _ls
-                    deep_on = bool(_ls().deep_enabled)
-                except Exception:
-                    deep_on = False
+                deep_on = bool(self.cfg.deep_enabled)
                 if not deep_on:
                     self._done(key)
                     self._submit_direct(key, lambda: "ℹ️ Deep mode (grok-4.7) is disabled for now; no AI call was made.", chat)

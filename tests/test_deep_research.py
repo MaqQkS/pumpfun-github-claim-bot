@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -241,14 +242,13 @@ class DeepTelegram(unittest.TestCase):
         user = self.BALA if user is None else user
         chat = self.GROUP if chat is None else chat
         ad = adapter
-        with mock.patch("research.config.load_settings",
-                        return_value=load_settings(env_file="/nonexistent", environ={}, deep_enabled=deep_enabled)):
-            s = tc.CommandService(self.cfg, lambda c, t: sent.append((c, t)),
-                                  adapter_factory=lambda: ad if ad is not None else mock.Mock())
-            s.handle(chat, user, tc.parse_command(text, "GitClaimedBot"))
-            _wait(lambda: sent, 2.0)
-            time.sleep(0.05)
-            return s, sent, ad
+        cfg = replace(self.cfg, deep_enabled=deep_enabled)
+        s = tc.CommandService(cfg, lambda c, t: sent.append((c, t)),
+                              adapter_factory=lambda: ad if ad is not None else mock.Mock())
+        s.handle(chat, user, tc.parse_command(text, "GitClaimedBot"))
+        _wait(lambda: sent, 2.0)
+        time.sleep(0.05)
+        return s, sent, ad
 
     def test_d_alone_disabled(self):
         _, sent, _ = self.go("/d", deep_enabled=False)
