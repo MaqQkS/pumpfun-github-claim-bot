@@ -8,9 +8,10 @@ from dataclasses import dataclass, field
 
 from .client import QueenAnswer, QueenClient, QueenError
 from .config import COMMANDS, Settings, load_settings
+from .deep_client import DeepClient, DeepConfigError, resolve_xai_api_key
 from .ledger import Ledger
 from .meter import Meter
-from .prompt import ClaimFacts, build_question
+from .prompt import DEEP_RESEARCH_TASK, ClaimFacts, build_question
 from .router import RoutePlan, route
 
 
@@ -31,11 +32,13 @@ class ResearchResult:
 
 
 class ResearchAdapter:
-    def __init__(self, settings: Settings | None = None, *, clients: dict | None = None, sleep=time.sleep):
+    def __init__(self, settings: Settings | None = None, *, clients: dict | None = None,
+                 deep_client=None, sleep=time.sleep):
         self.s = settings or load_settings()
         self.ledger = Ledger(self.s.ledger_path)
         self.meter = Meter(self.s.meter_path, self.s.prices)
         self._clients = clients or {}
+        self._deep_client = deep_client  # injected FakeDeepClient in tests; else built lazily
         self._sleep = sleep
         self._gate = threading.BoundedSemaphore(max(1, self.s.max_in_flight))
         self._lock = threading.Lock()
@@ -46,6 +49,21 @@ class ResearchAdapter:
         if url not in self._clients:
             self._clients[url] = QueenClient(url, max_retries=self.s.max_retries, backoff_s=self.s.retry_backoff_s, sleep=self._sleep)
         return self._clients[url]
+
+    def get_deep_client(self):
+        if self._deep_client is not None:
+            return self._deep_client
+        if (self.s.deep_backend or "xai_native").lower() == "queen":
+            return None  # use Queen HTTP on deep_url
+        key = self.s.xai_api_key or resolve_xai_api_key(env_file=self.s.xai_env_file or None)
+        if not key:
+            raise DeepConfigError(
+                "Deep research needs an xAI API key (RESEARCH_XAI_API_KEY or Queen .env LLM_API_KEY).")
+        price = self.s.prices.get(self.s.deep_model) or self.s.prices.get("grok-4.7")
+        self._deep_client = DeepClient(
+            key, model=self.s.deep_model, effort=self.s.deep_effort, price=price,
+            max_turns=self.s.deep_max_turns, sleep=self._sleep)
+        return self._deep_client
 
     def health(self) -> dict:
         out = {"standard": self.client_for(self.s.standard_url).health()}
@@ -110,6 +128,7 @@ class ResearchAdapter:
              source: str = "manual", auto: dict | None = None) -> ResearchResult:
         from .formatter import format_result
         mode = "deep" if plan.deep else "standard"
+        use_native = plan.deep and (self.s.deep_backend or "xai_native").lower() != "queen"
         if not self._gate.acquire(timeout=1.0):
             return ResearchResult(False, plan, "Another research is running; try again shortly.", "busy_local")
         try:
@@ -117,26 +136,54 @@ class ResearchAdapter:
                                            effort=plan.effort, mint=plan.mint, source=source, auto=auto)
             if row is None:
                 return ResearchResult(False, plan, f"Research paused: budget limit reached ({dec.reason}).", "budget")
-            task = COMMANDS[plan.command].task
-            question = build_question(task, facts, COMMANDS[plan.command].limited, COMMANDS[plan.command].answer_format,
-                                      context=context)
+            if plan.deep and plan.command == "research":
+                task = DEEP_RESEARCH_TASK
+                answer_format = "deep_research"
+                limited = None
+            else:
+                task = COMMANDS[plan.command].task
+                answer_format = COMMANDS[plan.command].answer_format
+                limited = COMMANDS[plan.command].limited
+            question = build_question(task, facts, limited, answer_format, context=context)
             mark = self.meter.mark()
             t0 = time.time()
+            deep_usage = None
             try:
-                ans, _ = self.client_for(plan.url).ask(question, plan.timeout_s)
+                if use_native:
+                    try:
+                        dc = self.get_deep_client()
+                    except DeepConfigError as e:
+                        self.ledger.finish(row, status="not_sent", error=e.code)
+                        return ResearchResult(False, plan, str(e) or "Deep research is not configured.", e.code,
+                                              ledger_id=row)
+                    ans, _, deep_usage = dc.ask(question, plan.timeout_s)
+                else:
+                    ans, _ = self.client_for(plan.url).ask(question, plan.timeout_s)
             except QueenError as e:
                 lat = int((time.time() - t0) * 1000)
-                usage = self._reconcile(mark)
-                status = "error" if (e.reached_queen or (usage and usage.get("llm_calls"))) else "not_sent"
-                if status == "error" and usage is not None:
-                    # Queen may still have been mid-call when we hung up: never record less than the reservation
-                    usage = {**usage, "actual_usd": max(usage.get("actual_usd") or 0.0, self.s.worst_case_usd.get(plan.model, 0.0)),
-                             "cost_source": "reservation_kept_after_error"}
+                if use_native:
+                    usage = None
+                    # Native Responses call: any error after the HTTP request started may have spent money.
+                    status = "error" if e.reached_queen else "not_sent"
+                    if status == "error":
+                        usage = {"actual_usd": self.s.worst_case_usd.get(plan.model, 0.0),
+                                 "cost_source": "reservation_kept_after_error", "llm_calls": 1,
+                                 "models": [plan.model]}
+                else:
+                    usage = self._reconcile(mark)
+                    status = "error" if (e.reached_queen or (usage and usage.get("llm_calls"))) else "not_sent"
+                    if status == "error" and usage is not None:
+                        # Queen may still have been mid-call when we hung up: never record less than the reservation
+                        usage = {**usage, "actual_usd": max(usage.get("actual_usd") or 0.0, self.s.worst_case_usd.get(plan.model, 0.0)),
+                                 "cost_source": "reservation_kept_after_error"}
                 self.ledger.finish(row, status=status, error=e.code, latency_ms=lat, usage=usage)
                 return ResearchResult(False, plan, f"Research unavailable right now ({e.code}). Alerts are unaffected.",
                                       e.code, usage=usage, latency_ms=lat, ledger_id=row)
             lat = int((time.time() - t0) * 1000)
-            usage = self._reconcile(mark)
+            if deep_usage is not None:
+                usage = deep_usage.as_meter(plan.model)
+            else:
+                usage = self._reconcile(mark)
             if usage and usage.get("models") and any(m != plan.model for m in usage["models"]):
                 usage["model_mismatch"] = usage["models"]
             self.ledger.finish(row, status="ok", latency_ms=lat, tools=ans.tools, usage=usage,

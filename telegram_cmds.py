@@ -198,7 +198,7 @@ def help_text(cfg: CmdConfig | None = None) -> str:
           "💬 Or reply to a GitClaim alert with /re /ho /gh /liq (no CA needed).",
           "", "🕒 <b>Coming soon</b>"]
     L.append(" ".join(f"/{s.aliases[0] if s.aliases else s.name}" for s in soon))
-    L += ["", "🔬 <code>/d re|dev|wa &lt;CA&gt;</code> deep mode (grok-4.7) — disabled for now",
+    L += ["", "ℹ️ <code>/d re &lt;CA&gt;</code> deep research (grok-4.7) — off until RESEARCH_DEEP_ENABLED=true",
           "/start subscribe to alerts · /stop unsubscribe"]
     return "\n".join(L)
 
@@ -213,6 +213,7 @@ class _Job:
     enqueued: float = field(default_factory=time.time)
     origin: str | None = None        # reply-to-alert: "stored" | "parsed"; None for /re <CA>
     auto: bool = False               # Phase 6 automatic research job
+    deep: bool = False               # /d re -> grok-4.7 deep research
     stale_at: float | None = None
 
 
@@ -258,14 +259,16 @@ class CommandService:
         except Exception:
             return "ledger unavailable"
 
-    def _budget_precheck(self, source="manual", limits=None) -> str | None:
+    def _budget_precheck(self, source="manual", limits=None, deep: bool = False) -> str | None:
         """xAI/Helius budget check BEFORE any free context gathering, so a refused job makes no direct Helius calls."""
         try:
             a = self.adapter()
             led, s = getattr(a, "ledger", None), getattr(a, "s", None)
             if led is None or s is None:
                 return None                              # test doubles without a ledger
-            dec = led.check(settings=s, model=s.standard_model, source=source, auto=limits)
+            model = s.deep_model if deep else s.standard_model
+            mode = "deep" if deep else "standard"
+            dec = led.check(settings=s, model=model, source=source, auto=limits, mode=mode)
             return None if dec.ok else dec.reason
         except Exception:
             return "ledger unavailable"
@@ -315,7 +318,16 @@ class CommandService:
 
     def _dispatch(self, chat, p: Parsed, key) -> bool:
         if p.name == DEEP and p.deep and not p.args:
-            self._done(key); self._submit_direct(key, lambda: "🔬 Use <code>/d re|dev|wa &lt;CA&gt;</code>. Deep mode (grok-4.7) is disabled for now.", chat)
+            deep_on = False
+            try:
+                from research.config import load_settings as _ls
+                deep_on = bool(_ls().deep_enabled)
+            except Exception:
+                deep_on = False
+            tip = ("Use <code>/d re &lt;CA&gt;</code> for deep research (grok-4.7). "
+                   "<code>/d dev</code> and <code>/d wa</code> are coming soon.") if deep_on else (
+                   "Use <code>/d re|dev|wa &lt;CA&gt;</code>. Deep mode (grok-4.7) is disabled for now.")
+            self._done(key); self._submit_direct(key, lambda: "ℹ️ " + tip, chat)
             return True
         spec = SPECS.get(p.name) if p.known else None
         if spec is None:
@@ -323,9 +335,34 @@ class CommandService:
             self._submit_direct(key, lambda: f"Unknown command /{E(p.name)}. Send /h for the list.", chat)
             return True
         if p.deep and spec.ai:
-            why = "Deep mode (grok-4.7) is disabled for now; no AI call was made." if spec.name in DEEP_CAPABLE \
-                else f"/d is only for re, dev and wa. /{spec.aliases[0]} has no deep mode."
-            self._done(key); self._submit_direct(key, lambda: "🔬 " + why + (f" Use <code>/re &lt;CA&gt;</code> for standard research." if spec.name == "research" else ""), chat)
+            if spec.name == "research":
+                deep_on = False
+                try:
+                    from research.config import load_settings as _ls
+                    deep_on = bool(_ls().deep_enabled)
+                except Exception:
+                    deep_on = False
+                if not deep_on:
+                    self._done(key)
+                    self._submit_direct(key, lambda: "ℹ️ Deep mode (grok-4.7) is disabled for now; no AI call was made. Use <code>/re &lt;CA&gt;</code> for standard research.", chat)
+                    return True
+                return self._enqueue_research(chat, p, key)
+            if spec.name in DEEP_CAPABLE:
+                deep_on = False
+                try:
+                    from research.config import load_settings as _ls
+                    deep_on = bool(_ls().deep_enabled)
+                except Exception:
+                    deep_on = False
+                if not deep_on:
+                    self._done(key)
+                    self._submit_direct(key, lambda: "ℹ️ Deep mode (grok-4.7) is disabled for now; no AI call was made.", chat)
+                    return True
+                self._done(key)
+                self._submit_direct(key, lambda: f"ℹ️ /d {E(spec.aliases[0] if spec.aliases else spec.name)} is coming soon.", chat)
+                return True
+            why = f"/d is only for re, dev and wa. /{spec.aliases[0]} has no deep mode."
+            self._done(key); self._submit_direct(key, lambda: "ℹ️ " + why, chat)
             return True
         if not spec.operational:
             self._done(key)
@@ -375,7 +412,7 @@ class CommandService:
             self._done(key)
             self._submit_direct(key, lambda: "Send a CA: <code>/re &lt;CA&gt;</code> (base58, 32–44 chars). Or reply <code>/re</code> to a GitClaim alert.", chat)
             return True
-        job = _Job(chat, mint, key)
+        job = _Job(chat, mint, key, deep=bool(p.deep))
         rc = getattr(self, "_reply_ctx", None)
         if rc is not None and rc.mint == mint:
             job.origin = rc.source
@@ -397,7 +434,10 @@ class CommandService:
         if full:
             self._out.submit(self._reply, chat, "⏳ Research is busy (queue full). Try again in a few minutes.")
         elif pos <= 1:
-            self._out.submit(self._reply, chat, f"🔎 Researching <code>{E(mint)}</code> with grok-4.3… usually 15–35s.")
+            if job.deep:
+                self._out.submit(self._reply, chat, f"🔎 Deep-researching <code>{E(mint)}</code> with grok-4.7 (X + web)… usually 45–120s.")
+            else:
+                self._out.submit(self._reply, chat, f"🔎 Researching <code>{E(mint)}</code> with grok-4.3… usually 15–35s.")
         else:
             self._out.submit(self._reply, chat, f"⏳ Queued, position {pos}. Research runs one at a time.")
         return True
@@ -530,7 +570,7 @@ class CommandService:
                 facts = None
         import project_context as pc
         pctx = None
-        why = self._budget_precheck()
+        why = self._budget_precheck(deep=bool(getattr(job, "deep", False)))
         if why:
             return f"💸 Research paused: budget limit reached ({E(why)}). Alerts are unaffected.\n<code>{E(job.mint)}</code>"
         try:                                                        # free reads, inside the single research slot
@@ -540,7 +580,10 @@ class CommandService:
         except Exception as e:
             log.warning("re context failed: %s", type(e).__name__)
         self.llm_calls += 1
-        res = self.adapter().research(f"re {job.mint}", facts, pc.context_block(pctx) if pctx else None)
+        cmd = f"d re {job.mint}" if getattr(job, "deep", False) else f"re {job.mint}"
+        res = self.adapter().research(cmd, facts, pc.context_block(pctx) if pctx else None)
+        if getattr(job, "deep", False):
+            return format_deep_research(job.mint, res, facts, pctx, origin=job.origin)
         return format_research(job.mint, res, facts, pctx, origin=job.origin)
 
     # ---- direct handlers (no LLM) ------------------------------------------
@@ -609,7 +652,7 @@ class CommandService:
             from research.ledger import Ledger
             s = load_settings()
             up = QueenClient(s.standard_url).health(timeout_s=1.0)
-            L.append(f"🧠 Queen (grok-4.3): {'🟢 online' if up else '⚪ offline'} · deep off")
+            L.append(f"🧠 Queen (grok-4.3): {'✅ online' if up else '❌ offline'} · deep {'on' if s.deep_enabled else 'off'}")
             lg = Ledger(s.ledger_path)
             t = lg.totals(); lg.close()
             L.append(f"💸 AI budget: ${max(0, s.budget_daily_usd - t['usd_today']):.2f} today · "
@@ -694,11 +737,13 @@ def format_github(d: dict) -> str:
     return "\n".join(L)
 
 
-_SEC = re.compile(r"^\W*(NARRATIVE|VERDICT|DATA)[*_\s]*[:\-–]?[*_\s]*(.*)$", re.I)
+_SEC = re.compile(r"^\W*(NARRATIVE|X_SENTIMENT|KEY_POSTS|WEBSITE|GITHUB|FUD|VERDICT|DATA)[*_\s]*[:\-–]?[*_\s]*(.*)$", re.I)
 
 
 def _split_answer(text: str) -> dict:
-    out, cur = {"NARRATIVE": [], "VERDICT": [], "DATA": [], "_pre": []}, "_pre"
+    sections = ("NARRATIVE", "X_SENTIMENT", "KEY_POSTS", "WEBSITE", "GITHUB", "FUD", "VERDICT", "DATA")
+    out, cur = {s: [] for s in sections}, "_pre"
+    out["_pre"] = []
     for line in text.split("\n"):
         m = _SEC.match(line)
         if m and m.group(1).upper() in out:
@@ -833,6 +878,86 @@ def scrub_ai_text(text: str) -> str:
 
 # ---- Phase 6: automatic research report -------------------------------------------------------
 AUTO_DISCLAIMER = "ℹ️ <i>Automatic research. Not a trading recommendation or a safety verdict.</i>"
+
+
+
+def format_deep_research(mint: str, res, facts=None, pctx=None, origin=None) -> str:
+    """Telegram HTML for /d re. Same sanitizers as /re; extra X / website / FUD sections."""
+    from research.formatter import preserve_addresses, sanitize_urls
+    if not res.ok:
+        msg = {"budget": "⛔ ", "queen_unavailable": "❌ ", "deep_config": "ℹ️ ", "deep_disabled": "ℹ️ "}.get(res.error or "", "⚠️ ")
+        extra = ""
+        if res.error == "queen_unavailable":
+            extra = "\nDeep Queen is offline; start it with scripts\\queen_win.ps1 deep start (or use xai_native backend)."
+        return f"{msg}{E(res.text)}{extra}\n<code>{E(mint)}</code>"
+    trusted = facts.addresses() if facts is not None else [mint]
+    raw = res.answer.answer if getattr(res, "answer", None) is not None else res.text
+    raw = re.sub(r"\n?```token\n.*?\n```\n?", "\n", raw, flags=re.S)
+    urep = sanitize_urls(raw, trusted)
+    arep = preserve_addresses(urep.text, trusted)
+    parts = _split_answer(scrub_ai_text(arep.text))
+    def join(key, limit=800):
+        s = " ".join(parts.get(key) or [])
+        return s if len(s) <= limit else s[: limit - 1].rsplit(" ", 1)[0] + "."
+    narrative = join("NARRATIVE", 600) or " ".join([x for x in parts.get("_pre") or [] if not x.startswith(("-", "•", "*"))][:4])
+    xsent = join("X_SENTIMENT", 400)
+    posts = [x.lstrip("-•* ").strip() for x in (parts.get("KEY_POSTS") or []) if x.lstrip().startswith(("-", "•", "*"))]
+    website = join("WEBSITE", 350)
+    github = join("GITHUB", 350)
+    fud = [x.lstrip("-•* ").strip() for x in (parts.get("FUD") or []) if x.lstrip().startswith(("-", "•", "*"))]
+    verdict = join("VERDICT", 240)
+    data = [x.lstrip("-•* ").strip() for x in (parts.get("DATA") or []) if x.lstrip().startswith(("-", "•", "*"))]
+    sym = (facts.symbol if facts is not None and facts.symbol else None)
+    flags = " · cached" if res.cached else ""
+    L = [f"🔬 <b>Deep · {E(sym) if sym else 'Research'}</b> · <code>{E(_short(mint))}</code>{flags}", ""]
+    if origin in ORIGIN_NOTE:
+        L.append(ORIGIN_NOTE[origin](facts))
+    L += ["🧠 <b>Narrative</b> <i>(interpretation)</i>", E(narrative) if narrative else "No narrative returned."]
+    if xsent:
+        L += ["", "🐦 <b>X sentiment</b>", E(xsent)]
+    if posts:
+        L += ["", "🧵 <b>Key posts</b>"] + [f"• {E(x[:200])}" for x in posts[:5]]
+    if website:
+        L += ["", "🌐 <b>Website</b>", E(website)]
+    if github:
+        L += ["", "💻 <b>GitHub</b>", E(github)]
+    L += ["", "🚩 <b>FUD / red flags</b> <i>(claims found, not verdicts)</i>"]
+    if fud:
+        L += [f"• {E(x[:220])}" for x in fud[:6]]
+    else:
+        L.append("• none found")
+    if verdict:
+        L.append(f"⚖️ {E(verdict)}")
+    if facts is None or not (facts.github_login or facts.claim_sol):
+        L += ["", "📋 No GitHub claim seen by GitClaim"]
+    else:
+        L += ["", "📋 <b>GitClaim facts</b>"]
+        who = facts.github_login or "?"
+        L.append(f"👤 {E(who)}" + (f" ({E(facts.github_display)})" if facts.github_display else ""))
+        if facts.claim_sol is not None:
+            L.append(f"💰 {facts.claim_sol:.2f} SOL · {E(facts.claim_kind or 'claim')}")
+    if data:
+        L += ["", "📊 <b>Key data</b>"] + [f"• {E(x[:160])}" for x in data[:5]]
+    links = [f'<a href="https://solscan.io/token/{E(mint)}">Solscan</a>',
+             f'<a href="https://dexscreener.com/solana/{E(mint)}">DexScreener</a>']
+    for lab, u in ((pctx or {}).get("links") or [])[:3]:
+        links.append(f'<a href="{E(u)}">{E(lab)}</a>')
+    L += ["", "🔗 " + " · ".join(links)]
+    L += ["", "<i>Not trading advice. FUD lines are claims found in sources, not confirmed facts.</i>"]
+    u = res.usage or {}
+    cost = u.get("actual_usd")
+    model = getattr(getattr(res, "plan", None), "model", None) or "grok-4.7"
+    meta = [f"🔬 {model}"]
+    if cost is not None:
+        meta.append(f"${cost:.4f}")
+    if res.latency_ms is not None:
+        meta.append(f"{res.latency_ms/1000:.1f}s")
+    if u.get("x_posts_fetched") is not None:
+        meta.append(f"X posts {u.get('x_posts_fetched')}")
+    if u.get("web_search_calls") is not None:
+        meta.append(f"web {u.get('web_search_calls')}")
+    L += ["", " · ".join(meta)]
+    return "\n".join(L)
 
 
 def format_auto_research(mint: str, res, facts=None, pctx=None, alert_msg_id=None) -> str:

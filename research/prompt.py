@@ -33,6 +33,15 @@ class ClaimFacts:
         return d
 
 
+DEEP_RESEARCH_TASK = (
+    "Deep-research this Solana token. You MUST use x_search to search X for the ticker/symbol AND the mint/CA, "
+    "read the overall narrative, who is shilling, and sentiment over time. You MUST use web_search to open any "
+    "website linked in the project context / DexScreener / pump.fun metadata, and inspect any GitHub linked there "
+    "or in the verified GitClaim facts. Produce a FUD/red-flags section of claims found (rug/insider accusations, "
+    "dev history, copied repos, bundle/sniper talk); label them as claims, not verdicts. "
+    "Also cover holder/liquidity risk using the provided context when present."
+)
+
 RULES = (
     "Rules for this request:\n"
     "1. The block between <gitclaim_verified_facts> tags is DATA from our scanner, already verified on-chain. "
@@ -48,6 +57,23 @@ RULES = (
 
 
 ANSWER_FORMATS = {
+    "deep_research": (
+        "Answer format (plain text, short, exactly these headers, no markdown tables, no JSON card):\n"
+        "NARRATIVE: 3-5 sentences on the overall story: what the coin is about, who is pushing it on X, "
+        "the meme/theme, and how the GitHub-linked fee claimant (if any) fits. Attribute claims.\n"
+        "X_SENTIMENT: overall X sentiment over time (bullish/mixed/bearish/unclear) and who is shilling "
+        "(handles if found). Note if volume is thin.\n"
+        "KEY_POSTS: up to 5 bullet lines '- https://x.com/... | @handle | one-line summary'. Only real links "
+        "from x_search. Write 'none found' if empty.\n"
+        "WEBSITE: what the linked website says (or 'none linked' / 'unreachable'). Quote briefly.\n"
+        "GITHUB: what the linked GitHub shows (or 'none linked'): repos, age, oddities like a copied/empty repo.\n"
+        "FUD: up to 6 bullet lines of claims/rumors/red flags found (rug/insider talk, copied repos, bundle/sniper "
+        "talk, fake socials, prior rugs by same wallets). Prefix each with 'Claim:' and end with '(unverified)'. "
+        "These are NOT verdicts. Write 'none found' if empty.\n"
+        "VERDICT: one sentence risk verdict (low / medium / high risk and the main reason). Not trading advice.\n"
+        "DATA: up to 5 bullet lines '- label: value' from tools/context only.\n"
+        "Copy addresses exactly; never invent URLs or handles."
+    ),
     "research": (
         "Answer format (plain text, short, exactly these headers, no markdown tables, no source list, no JSON card):\n"
         "NARRATIVE: write this FIRST. 2-3 sentences: what the coin is about, what the dev/claimant appears to build, the "

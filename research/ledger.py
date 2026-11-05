@@ -67,6 +67,14 @@ class Ledger:
         t, d, hd, ht, n = self._db.execute(q, (day, day)).fetchone()
         return {"usd_total": t, "usd_today": d, "helius_today": hd, "helius_total": ht, "requests": n}
 
+    def deep_totals(self, day: str | None = None) -> dict:
+        """USD spent today on mode='deep' (real cost if known, else reservation)."""
+        day = day or utc_day()
+        q = (f"SELECT COALESCE(SUM(CASE WHEN mode='deep' THEN {_USD} ELSE 0 END),0), "
+             f"COALESCE(SUM(CASE WHEN mode='deep' THEN 1 ELSE 0 END),0) FROM requests WHERE day=?")
+        u, n = self._db.execute(q, (day,)).fetchone()
+        return {"usd_today": u, "runs_today": n}
+
     def auto_totals(self, day: str | None = None) -> dict:
         day = day or utc_day()
         q = (f"SELECT COALESCE(SUM(CASE WHEN source='auto' THEN {_USD} ELSE 0 END),0), COALESCE(SUM({_HEL}),0), "
@@ -102,10 +110,11 @@ class Ledger:
                              "helius_measured,cost_source,source) VALUES(?,?,?,?,?,?,'ok',0,0,?,'local_estimate','direct')",
                              (now, utc_day(now), command, "direct", "helius:" + method, mint, int(credits)))
 
-    def check(self, *, settings, model: str, source: str = "manual", auto: dict | None = None) -> BudgetDecision:
+    def check(self, *, settings, model: str, source: str = "manual", auto: dict | None = None,
+              mode: str = "standard") -> BudgetDecision:
         """Same rules as reserve() without writing (used before free context gathering)."""
         with self._lock:
-            return self._decide(settings, model, source, auto)
+            return self._decide(settings, model, source, auto, mode)
 
     def helius_allowed(self, settings, need: int) -> BudgetDecision:
         t = self.totals()
@@ -115,10 +124,21 @@ class Ledger:
             return BudgetDecision(False, f"helius_total: ~{t['helius_total']} credits of {settings.helius_total_credits}")
         return BudgetDecision(True)
 
-    def _decide(self, settings, model, source, auto) -> BudgetDecision:
+    def _decide(self, settings, model, source, auto, mode: str = "standard") -> BudgetDecision:
         wc = float(settings.worst_case_usd.get(model, max(settings.worst_case_usd.values())))
         t = self.totals()
         dec = BudgetDecision(True, None, t["usd_total"], t["usd_today"], t["helius_today"])
+        if mode == "deep":
+            d = self.deep_totals()
+            cap = float(getattr(settings, "deep_daily_usd", 0) or 0)
+            if cap <= 0:
+                dec.ok, dec.reason = False, "deep_daily_usd: deep daily cap is 0 (disabled)"
+                return dec
+            if d["usd_today"] + wc > cap:
+                dec.ok, dec.reason = False, (
+                    f"deep_daily_usd: ${d['usd_today']:.4f} spent on deep today of ${cap:.2f}, "
+                    f"next may cost up to ${wc:.2f}")
+                return dec
         if source == "auto":
             a, lim = self.auto_totals(), auto or {}
             if a["runs_today"] + 1 > int(lim.get("max_per_day") or 0):
@@ -145,7 +165,7 @@ class Ledger:
         source='auto' must ALSO fit `auto` = {"daily_usd", "max_per_day", "daily_helius"}; missing/zero => refused."""
         wc = float(settings.worst_case_usd.get(model, max(settings.worst_case_usd.values())))
         with self._lock:
-            dec = self._decide(settings, model, source, auto)
+            dec = self._decide(settings, model, source, auto, mode)
             if not dec.ok:
                 return None, dec
             now = time.time()

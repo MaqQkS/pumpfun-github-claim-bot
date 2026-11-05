@@ -98,10 +98,14 @@ class Settings:
     standard_effort: str = "high"
     deep_url: str = "http://127.0.0.1:8791"
     deep_model: str = "grok-4.7"
-    deep_effort: str = "low"
+    deep_effort: str = "medium"                 # 4.7 supports low/medium/high/xhigh; medium balances depth vs cost
     deep_enabled: bool = False                  # /d is refused unless this is true
+    # xai_native = Responses API with x_search+web_search (recommended). queen = local deep Queen :8791.
+    deep_backend: str = "xai_native"
+    deep_max_turns: int = 6                     # Responses API tool-loop cap (cost control)
+    deep_daily_usd: float = 1.00                # separate daily cap for deep runs (also counts toward global)
     timeout_standard_s: float = 190.0
-    timeout_deep_s: float = 120.0
+    timeout_deep_s: float = 180.0               # tool loops need more time than plain /re
     max_in_flight: int = 1
     max_retries: int = 2                        # transient errors only (connection refused, 502/503, 429)
     retry_backoff_s: float = 2.0
@@ -109,7 +113,10 @@ class Settings:
     # USD budgets (local accounting, see README: not a provider hard cap)
     budget_total_usd: float = 5.00
     budget_daily_usd: float = 0.50
-    worst_case_usd: dict = field(default_factory=lambda: {"grok-4.3": 0.20, "grok-4.7": 0.15})
+    # grok-4.7 worst case includes token spend + native tool invocations (see deep_client.py)
+    worst_case_usd: dict = field(default_factory=lambda: {"grok-4.3": 0.20, "grok-4.7": 1.00})
+    xai_api_key: str = ""                       # optional; else RESEARCH_XAI_API_KEY / Queen .env LLM_API_KEY
+    xai_env_file: str = ""                      # optional path to Queen .env for LLM_API_KEY
     # Helius credits (Queen's own key; estimates, not Helius billing)
     helius_est_per_research: int = 205
     helius_worst_case: int = 400
@@ -146,13 +153,16 @@ _FIELDS = {
     "RESEARCH_STANDARD_URL": ("standard_url", str), "RESEARCH_STANDARD_MODEL": ("standard_model", str),
     "RESEARCH_STANDARD_EFFORT": ("standard_effort", str), "RESEARCH_DEEP_URL": ("deep_url", str),
     "RESEARCH_DEEP_MODEL": ("deep_model", str), "RESEARCH_DEEP_EFFORT": ("deep_effort", str),
-    "RESEARCH_DEEP_ENABLED": ("deep_enabled", _bool), "RESEARCH_TIMEOUT_STANDARD_S": ("timeout_standard_s", float),
+    "RESEARCH_DEEP_ENABLED": ("deep_enabled", _bool), "RESEARCH_DEEP_BACKEND": ("deep_backend", str),
+    "RESEARCH_DEEP_MAX_TURNS": ("deep_max_turns", int), "RESEARCH_DEEP_DAILY_USD": ("deep_daily_usd", float),
+    "RESEARCH_TIMEOUT_STANDARD_S": ("timeout_standard_s", float),
     "RESEARCH_TIMEOUT_DEEP_S": ("timeout_deep_s", float), "RESEARCH_MAX_IN_FLIGHT": ("max_in_flight", int),
     "RESEARCH_MAX_RETRIES": ("max_retries", int), "RESEARCH_CACHE_TTL_S": ("cache_ttl_s", float),
     "RESEARCH_BUDGET_TOTAL_USD": ("budget_total_usd", float), "RESEARCH_BUDGET_DAILY_USD": ("budget_daily_usd", float),
     "RESEARCH_HELIUS_DAILY_CREDITS": ("helius_daily_credits", int),
     "RESEARCH_HELIUS_TOTAL_CREDITS": ("helius_total_credits", int),
     "RESEARCH_LEDGER_PATH": ("ledger_path", str), "RESEARCH_METER_PATH": ("meter_path", str),
+    "RESEARCH_XAI_API_KEY": ("xai_api_key", str), "RESEARCH_XAI_ENV_FILE": ("xai_env_file", str),
 }
 
 

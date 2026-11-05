@@ -100,7 +100,8 @@ class Base(unittest.TestCase):
         self.addCleanup(self.stub.close)
         s = load_settings(env_file=os.path.join(self.tmp, "none.env"), environ={}, standard_url=self.stub.url,
                           deep_url=self.stub.url, ledger_path=os.path.join(self.tmp, "l.sqlite3"),
-                          meter_path=self.meter, retry_backoff_s=0.01, **{"worst_case_usd": LOGIC_WC, **kw})
+                          meter_path=self.meter, retry_backoff_s=0.01, deep_backend="queen",
+                          **{"worst_case_usd": LOGIC_WC, **kw})
         return ResearchAdapter(s, sleep=lambda _x: None)
 
 
@@ -135,7 +136,8 @@ class TestRouting(unittest.TestCase):
     def test_deep_when_enabled(self):
         s = load_settings(env_file="/nonexistent", environ={}, deep_enabled=True)
         p = route(f"/d re {FFM}", s)
-        self.assertEqual((p.model, p.deep, p.timeout_s, p.url), ("grok-4.7", True, 120.0, s.deep_url))
+        self.assertEqual((p.model, p.deep, p.timeout_s, p.url), ("grok-4.7", True, 180.0, s.deep_url))
+        self.assertEqual(p.effort, "medium")
         self.assertEqual(route(f"/re {FFM}", s).model, "grok-4.3")
         # deep is only for re/dev/wa
         for c in ("rk", "nar"):
