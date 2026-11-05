@@ -186,12 +186,20 @@ def compact(v):
     return f"${v:.0f}"
 
 _creator = {}
-_ATH_NOTE = {}                 # mint -> "gt" (approximate, GeckoTerminal) | "blocked" | "not_indexed" | "error"
+_ATH_NOTE = {}                 # mint -> gt | rate_limited | not_on_gt | gt_error | blocked (GT not attempted)
 _PF = {"fail": 0, "fail_streak": 0, "blocked": False, "last_warn": 0.0}
-_GT_CACHE = {}                 # mint -> (expires, ath_usd or None)
-_GT_CALLS = collections.deque()
+_GT_CACHE = {}                 # mint -> (expires, (ath_usd or None, note))
+_GT_CALLS = collections.deque()  # shared global per-process limiter across all alerts
 GT = "https://api.geckoterminal.com/api/v2/networks/solana"
-GT_MAX_PER_MIN = 20            # GeckoTerminal free tier is ~30/min; stay well under
+GT_MAX_PER_MIN = 15            # free tier ~30/min; stay under so bursts of alerts don't 429
+GT_NEG_CACHE_S = {"rate_limited": 20, "not_on_gt": 120, "gt_error": 60}
+GT_RETRY_CAP_S = 2.5           # one 429 retry; don't stall the alert path
+
+class GtHttpError(IOError):
+    """GeckoTerminal failure with a stable reason for ATH labels."""
+    def __init__(self, reason: str, detail: str = ""):
+        self.reason = reason          # rate_limited | not_on_gt | gt_error
+        super().__init__(detail or reason)
 
 def _pf_status(status, blocked):
     """Log non-OK pump.fun responses with a running count; one WARNING when a block starts (then at most hourly)."""
@@ -210,32 +218,54 @@ def _pf_ok():
         log.info("pump.fun API recovered after %d failed calls", _PF["fail_streak"])
     _PF["blocked"] = False; _PF["fail_streak"] = 0
 
-def _gt_get(path):
+def _gt_get(path, *, _retried=False):
+    """GET GeckoTerminal; one short retry on HTTP 429 (Retry-After capped). Shared per-minute budget."""
     now = time.time()
-    while _GT_CALLS and now - _GT_CALLS[0] > 60: _GT_CALLS.popleft()
-    if len(_GT_CALLS) >= GT_MAX_PER_MIN: raise IOError("geckoterminal local rate limit")
+    while _GT_CALLS and now - _GT_CALLS[0] > 60:
+        _GT_CALLS.popleft()
+    if len(_GT_CALLS) >= GT_MAX_PER_MIN:
+        raise GtHttpError("rate_limited", "geckoterminal local rate limit")
     _GT_CALLS.append(now)
     r = requests.get(GT + path, timeout=6, headers={"Accept": "application/json"})
-    if r.status_code != 200: raise IOError(f"geckoterminal HTTP {r.status_code}")
+    if r.status_code == 429:
+        if not _retried:
+            raw = (r.headers.get("Retry-After") or "").strip()
+            try:
+                wait = float(raw) if raw else 2.0
+            except ValueError:
+                wait = 2.0
+            wait = max(0.2, min(GT_RETRY_CAP_S, wait))
+            log.info("geckoterminal HTTP 429; retrying once after %.1fs", wait)
+            time.sleep(wait)
+            return _gt_get(path, _retried=True)
+        raise GtHttpError("rate_limited", "geckoterminal HTTP 429")
+    if r.status_code == 404:
+        raise GtHttpError("not_on_gt", "geckoterminal HTTP 404")
+    if r.status_code != 200:
+        raise GtHttpError("gt_error", f"geckoterminal HTTP {r.status_code}")
     return r.json()
 
 def gt_ath(mint):
     """Approximate ATH market cap (USD) from GeckoTerminal's free API: top pool's highest hourly candle (daily if the
     token is older than ~40 days) x supply. pump.fun mints use the fixed 1B supply; others use fdv/price from GT.
-    Returns (ath or None, note) where note is 'gt', 'not_indexed' or 'error'. Never raises."""
+    Returns (ath or None, note) where note is 'gt' | 'rate_limited' | 'not_on_gt' | 'gt_error'. Never raises."""
     hit = _GT_CACHE.get(mint)
-    if hit and hit[0] > time.time(): return hit[1]
+    if hit and hit[0] > time.time():
+        return hit[1]
     try:
         pools = (_gt_get(f"/tokens/{mint}/pools?page=1") or {}).get("data") or []
-        if not pools: out = (None, "not_indexed")
+        if not pools:
+            out = (None, "not_on_gt")
         else:
             pool = pools[0]["attributes"]["address"]
-            if mint.endswith("pump"): supply = 1e9
+            if mint.endswith("pump"):
+                supply = 1e9
             else:
-                t = ((_gt_get(f"/tokens/{mint}") or {}).get("data") or {}).get("attributes") or {}
-                price, fdv = float(t.get("price_usd") or 0), float(t.get("fdv_usd") or 0)
+                tok = ((_gt_get(f"/tokens/{mint}") or {}).get("data") or {}).get("attributes") or {}
+                price, fdv = float(tok.get("price_usd") or 0), float(tok.get("fdv_usd") or 0)
                 supply = fdv / price if price > 0 and fdv > 0 else None
-            if not supply: out = (None, "not_indexed")
+            if not supply:
+                out = (None, "not_on_gt")
             else:
                 c = ((_gt_get(f"/pools/{pool}/ohlcv/hour?aggregate=1&limit=1000&currency=usd&token=base") or {})
                      .get("data") or {}).get("attributes", {}).get("ohlcv_list") or []
@@ -243,10 +273,19 @@ def gt_ath(mint):
                     c += ((_gt_get(f"/pools/{pool}/ohlcv/day?aggregate=1&limit=1000&currency=usd&token=base") or {})
                           .get("data") or {}).get("attributes", {}).get("ohlcv_list") or []
                 highs = [float(x[2]) for x in c if len(x) > 2 and x[2]]
-                out = (max(highs) * supply, "gt") if highs else (None, "not_indexed")
+                out = (max(highs) * supply, "gt") if highs else (None, "not_on_gt")
+    except GtHttpError as e:
+        log.info("geckoterminal ATH for %s failed: %s (%s)", mint[:8], e.reason, str(e)[:60])
+        out = (None, e.reason)
     except Exception as e:
-        log.info("geckoterminal ATH for %s failed: %s", mint[:8], str(e)[:80]); out = (None, "error")
-    _GT_CACHE[mint] = (time.time() + (600 if out[0] is not None else 120), out)
+        log.info("geckoterminal ATH for %s failed: gt_error (%s)", mint[:8], str(e)[:80])
+        out = (None, "gt_error")
+    # Success caches longer; 429/rate-limit only a short negative cache so the next alert can retry.
+    if out[0] is not None:
+        ttl = 600
+    else:
+        ttl = GT_NEG_CACHE_S.get(out[1], 60)
+    _GT_CACHE[mint] = (time.time() + ttl, out)
     return out
 
 def coin_info(mint):
@@ -272,13 +311,18 @@ def coin_info(mint):
     if not sym:
         a = rpc("getAsset", {"id": mint})
         if a: sym = (a.get("content", {}).get("metadata") or {}).get("symbol")
-    _ATH_NOTE.pop(mint, None)
+    if mint:
+        _ATH_NOTE.pop(mint, None)
     if ath is None:
-        g, note = gt_ath(mint) if mint else (None, "not_indexed")
-        if g is not None:
-            ath = max(g, mc or 0); _ATH_NOTE[mint] = "gt"
-        else:
-            _ATH_NOTE[mint] = "blocked" if pf_blocked else note if note == "not_indexed" else "error"
+        if mint:
+            # Always try GT when we have a mint; label the GT reason (never mask it as pump.fun blocked).
+            g, note = gt_ath(mint)
+            if g is not None:
+                ath = max(g, mc or 0); _ATH_NOTE[mint] = "gt"
+            else:
+                _ATH_NOTE[mint] = note
+        elif pf_blocked:
+            _ATH_NOTE[None] = "blocked"   # GT not attempted (no mint)
     return sym or "UNKNOWN", mc, ath
 
 E = html.escape
@@ -296,7 +340,15 @@ def _token_block(sym, mint, mc, ath):
     if ath:
         athv = f"~{E(compact(ath))} (GT)" if note == "gt" else E(compact(ath))
     else:
-        athv = {"blocked": "n/a (pump.fun blocked)", "not_indexed": "n/a (not indexed)"}.get(note, "n/a")
+        # Honest labels: GT failure reason wins when GT was attempted; "pump.fun blocked" only if GT was not.
+        athv = {
+            "blocked": "n/a (pump.fun blocked)",
+            "rate_limited": "n/a (GT rate-limited)",
+            "not_on_gt": "n/a (not on GT)",
+            "not_indexed": "n/a (not on GT)",   # legacy note from older cache/code
+            "gt_error": "n/a (GT error)",
+            "error": "n/a (GT error)",
+        }.get(note, "n/a")
     return f"${E(str(sym))}\n{ca}\n\n🧠 Token\n• MC: {E(compact(mc))} | ATH: {athv}"
 
 def _hdr(sym, mint, mc, ath):  # kept for compatibility
