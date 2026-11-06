@@ -1,4 +1,4 @@
-"""ATH: pump.fun first, GeckoTerminal approximate fallback, honest labels, 429 retry. Mocked HTTP only."""
+"""ATH: pump.fun -> GeckoTerminal -> DexScreener; honest labels; GT 429 retry + global backoff. Mocked HTTP only."""
 import time
 import types
 import unittest
@@ -25,12 +25,19 @@ class R:
 def gt_pools(addr="POOL1"): return R(200, {"data": [{"attributes": {"address": addr}}]})
 def gt_ohlcv(highs): return R(200, {"data": {"attributes": {"ohlcv_list": [[0, 1, h, 0.5, 1, 9] for h in highs]}}})
 DEX = R(200, [{"baseToken": {"symbol": "FFH"}, "marketCap": 29200}])
+DEX_ATH = R(200, [{"baseToken": {"symbol": "FFH"}, "marketCap": 10000,
+                   "liquidity": {"usd": 5000},
+                   "priceChange": {"h1": -50.0, "h6": -20.0, "h24": -75.0}}])  # implied peak 40k
+DEX_NO_CH = R(200, [{"baseToken": {"symbol": "FFH"}, "marketCap": 10000, "liquidity": {"usd": 1}}])
+DEX_EMPTY = R(200, [])
 
 
 class Base(unittest.TestCase):
     def setUp(self):
-        for d in (bot._GT_CACHE, bot._ATH_NOTE, bot._creator): d.clear()
-        bot._GT_CALLS.clear(); bot._PF.update(fail=0, fail_streak=0, blocked=False, last_warn=0.0)
+        for d in (bot._GT_CACHE, bot._ATH_NOTE, bot._creator, bot._DS_CACHE): d.clear()
+        bot._GT_CALLS.clear(); bot._DS_CALLS.clear()
+        bot._GT_BACKOFF_UNTIL = 0.0
+        bot._PF.update(fail=0, fail_streak=0, blocked=False, last_warn=0.0)
         self.calls = []
         self.sleeps = []
         p = mock.patch.object(bot, "rpc", lambda *a, **k: None); p.start(); self.addCleanup(p.stop)
@@ -82,78 +89,92 @@ class TestAth(Base):
         self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX, "pools?page": gt_pools(), "/ohlcv/hour": gt_ohlcv([1e-5])})
         self.assertIn("ATH: ~$29.2k (GT)", self.line(PUMP))
 
-    def test_gt_500_after_pf_block_labeled_gt_error(self):
-        """Honest label: GT was attempted; do not say pump.fun blocked."""
-        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX, "geckoterminal": R(500)})
+    def test_gt_500_then_ds_success(self):
+        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX_ATH, "geckoterminal": R(500)})
         with self.assertLogs("bot", level="INFO") as L:
-            self.assertIn("ATH: n/a (GT error)", self.line(PUMP))
-        self.assertTrue(any("gt_error" in x and "AopEmtfy" not in x for x in L.output) or any("gt_error" in x for x in L.output))
+            self.assertIn("ATH: ~$40k (DS)", self.line(PUMP))
         self.assertTrue(any("geckoterminal ATH" in x and "gt_error" in x for x in L.output))
 
-    def test_not_on_gt_empty_pools(self):
-        self.route({"pump.fun": R(404, None, "nf"), "dexscreener": R(200, []), "geckoterminal": R(200, {"data": []})})
-        self.assertIn("ATH: n/a (not on GT)", self.line(PUMP))
+    def test_gt_500_ds_miss_labeled_not_indexed(self):
+        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX_EMPTY, "geckoterminal": R(500)})
+        self.assertIn("ATH: n/a (not indexed)", self.line(PUMP))
 
-    def test_not_on_gt_http_404(self):
-        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX, "geckoterminal": R(404)})
-        self.assertIn("ATH: n/a (not on GT)", self.line(PUMP))
+    def test_gt_500_ds_no_pricechange_not_indexed(self):
+        """Bare current MC is not an ATH — stay honest."""
+        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX_NO_CH, "geckoterminal": R(500)})
+        self.assertIn("ATH: n/a (not indexed)", self.line(PUMP))
 
-    def test_pf_500_gt_500_labeled_gt_error(self):
-        self.route({"pump.fun": R(500, None, "err"), "dexscreener": DEX, "geckoterminal": R(500)})
-        self.assertIn("ATH: n/a (GT error)", self.line(PUMP))
+    def test_not_on_gt_falls_to_ds(self):
+        self.route({"pump.fun": R(404, None, "nf"), "dexscreener": DEX_ATH, "geckoterminal": R(200, {"data": []})})
+        self.assertIn("ATH: ~$40k (DS)", self.line(PUMP))
 
-    def test_timeouts_labeled_gt_error(self):
-        self.route({"pump.fun": real.exceptions.ReadTimeout("t"), "dexscreener": DEX,
+    def test_not_on_gt_http_404_then_ds_miss(self):
+        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX_EMPTY, "geckoterminal": R(404)})
+        self.assertIn("ATH: n/a (not indexed)", self.line(PUMP))
+
+    def test_pf_500_gt_500_ds_error(self):
+        self.route({"pump.fun": R(500, None, "err"), "dexscreener": R(500), "geckoterminal": R(500)})
+        self.assertIn("ATH: n/a (not indexed)", self.line(PUMP))
+
+    def test_timeouts_then_ds(self):
+        self.route({"pump.fun": real.exceptions.ReadTimeout("t"), "dexscreener": DEX_ATH,
                     "geckoterminal": real.exceptions.ConnectTimeout("t")})
-        self.assertIn("ATH: n/a (GT error)", self.line(PUMP))
-        self.route({"pump.fun": real.exceptions.ReadTimeout("t"), "dexscreener": DEX,
-                    "pools?page": gt_pools(), "/ohlcv/hour": gt_ohlcv([5e-5])})
-        for d in (bot._GT_CACHE, bot._ATH_NOTE): d.clear()
-        self.assertIn("ATH: ~$50k (GT)", self.line(PUMP))
+        self.assertIn("ATH: ~$40k (DS)", self.line(PUMP))
 
-    def test_429_retries_once_then_rate_limited_label(self):
-        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX,
+    def test_429_retries_once_then_ds_success(self):
+        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX_ATH,
                     "geckoterminal": [R(429, None, "slow", {"Retry-After": "1"}), R(429, None, "slow")]})
         with self.assertLogs("bot", level="INFO") as L:
-            self.assertIn("ATH: n/a (GT rate-limited)", self.line(PUMP))
+            self.assertIn("ATH: ~$40k (DS)", self.line(PUMP))
         self.assertEqual(len(self.sleeps), 1)
         self.assertLessEqual(self.sleeps[0], bot.GT_RETRY_CAP_S)
         self.assertTrue(any("429" in x and "retrying" in x for x in L.output))
-        self.assertTrue(any("rate_limited" in x for x in L.output))
-        # two GETs to same pools path (initial + retry)
-        self.assertGreaterEqual(sum("geckoterminal" in u for u in self.calls), 2)
+        self.assertTrue(any("global backoff" in x for x in L.output))
+        self.assertGreater(bot._GT_BACKOFF_UNTIL, time.time())
 
-    def test_429_retry_succeeds(self):
+    def test_429_retry_succeeds_without_ds(self):
         self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX,
                     "pools?page": [R(429, None, "x", {"Retry-After": "1"}), gt_pools()],
                     "/ohlcv/hour": gt_ohlcv([3.11e-5])})
         self.assertIn("ATH: ~$31.1k (GT)", self.line(PUMP))
         self.assertEqual(len(self.sleeps), 1)
 
+    def test_global_backoff_skips_further_gt_calls(self):
+        other = "AnotherMint1111111111111111111111111111111pump"
+        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX_ATH,
+                    "geckoterminal": [R(429, None, "x", {"Retry-After": "45"}), R(429, None, "x")]})
+        self.assertIn("ATH: ~$40k (DS)", self.line(PUMP))  # arms backoff + DS success
+        n = len(self.calls)
+        bot._GT_CACHE.clear(); bot._ATH_NOTE.clear(); bot._DS_CACHE.clear()
+        self.assertIn("ATH: ~$40k (DS)", self.line(other))
+        # Second alert must not hit GT while backoff is active.
+        self.assertEqual(sum("geckoterminal" in u for u in self.calls[n:]), 0)
+
     def test_rate_limited_not_cached_long(self):
-        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX, "geckoterminal": R(429)})
+        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX_EMPTY, "geckoterminal": R(429)})
         self.line(PUMP)
         exp, payload = bot._GT_CACHE[PUMP]
         self.assertIsNone(payload[0])
         self.assertEqual(payload[1], "rate_limited")
         self.assertLessEqual(exp - time.time(), bot.GT_NEG_CACHE_S["rate_limited"] + 1)
 
-    def test_non_pump_mint_uses_gt_supply_or_not_on_gt(self):
+    def test_non_pump_mint_uses_gt_supply_or_ds(self):
         self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX, "pools?page": gt_pools(),
                     f"/tokens/{OTHER}": R(200, {"data": {"attributes": {"price_usd": "0.002", "fdv_usd": "2000000"}}}),
                     "/ohlcv/hour": gt_ohlcv([0.004])})
         self.assertIn("ATH: ~$4M (GT)", self.line(OTHER))
-        for d in (bot._GT_CACHE, bot._ATH_NOTE): d.clear()
-        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX, "pools?page": gt_pools(),
+        for d in (bot._GT_CACHE, bot._ATH_NOTE, bot._DS_CACHE): d.clear()
+        bot._GT_BACKOFF_UNTIL = 0.0
+        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX_ATH, "pools?page": gt_pools(),
                     f"/tokens/{OTHER}": R(200, {"data": {"attributes": {}}}), "/ohlcv/hour": gt_ohlcv([0.004])})
-        # GT attempted; missing supply => not on GT (not pump.fun blocked)
-        self.assertIn("ATH: n/a (not on GT)", self.line(OTHER))
+        # missing GT supply => DS fallback
+        self.assertIn("ATH: ~$40k (DS)", self.line(OTHER))
 
     def test_shared_rate_limit_and_warn_once(self):
-        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX, "geckoterminal": R(500)})
+        self.route({"pump.fun": R(403, None, CF), "dexscreener": DEX_EMPTY, "geckoterminal": R(500)})
         with self.assertLogs("bot", level="INFO") as L:
             for i in range(25):
-                bot._GT_CACHE.clear(); bot.coin_info(PUMP)
+                bot._GT_CACHE.clear(); bot._DS_CACHE.clear(); bot.coin_info(PUMP)
         self.assertEqual(sum("pump.fun API blocked" in x for x in L.output), 1)
         self.assertLessEqual(sum("geckoterminal.com" in u for u in self.calls), bot.GT_MAX_PER_MIN)
         self.assertTrue(any("rate_limited" in x or "local rate limit" in x for x in L.output))

@@ -186,14 +186,23 @@ def compact(v):
     return f"${v:.0f}"
 
 _creator = {}
-_ATH_NOTE = {}                 # mint -> gt | rate_limited | not_on_gt | gt_error | blocked (GT not attempted)
+_ATH_NOTE = {}                 # mint -> gt | ds | rate_limited | not_on_gt | gt_error | not_indexed | blocked
 _PF = {"fail": 0, "fail_streak": 0, "blocked": False, "last_warn": 0.0}
 _GT_CACHE = {}                 # mint -> (expires, (ath_usd or None, note))
 _GT_CALLS = collections.deque()  # shared global per-process limiter across all alerts
+_GT_BACKOFF_UNTIL = 0.0        # after a real GT 429, pause further GT calls globally
 GT = "https://api.geckoterminal.com/api/v2/networks/solana"
-GT_MAX_PER_MIN = 15            # free tier ~30/min; stay under so bursts of alerts don't 429
+GT_MAX_PER_MIN = 15            # free tier ~30/min; each ATH lookup can use 2–4 calls
 GT_NEG_CACHE_S = {"rate_limited": 20, "not_on_gt": 120, "gt_error": 60}
 GT_RETRY_CAP_S = 2.5           # one 429 retry; don't stall the alert path
+GT_BACKOFF_DEFAULT_S = 45      # global cool-down after 429 so one hit doesn't spray the minute
+GT_BACKOFF_CAP_S = 60
+_DS_CACHE = {}                 # mint -> (expires, (ath_usd or None, note, pairs_or_none))
+_DS_CALLS = collections.deque()
+DS_URL = "https://api.dexscreener.com/tokens/v1/solana"
+DS_MAX_PER_MIN = 30            # DS free tier ~300/min; stay polite
+DS_CACHE_OK_S = 90
+DS_NEG_CACHE_S = 45
 
 class GtHttpError(IOError):
     """GeckoTerminal failure with a stable reason for ATH labels."""
@@ -218,9 +227,27 @@ def _pf_ok():
         log.info("pump.fun API recovered after %d failed calls", _PF["fail_streak"])
     _PF["blocked"] = False; _PF["fail_streak"] = 0
 
+def _gt_arm_backoff(retry_after_header=""):
+    """Stop further GT calls process-wide after a 429 so one hit doesn't burn the rest of the minute."""
+    global _GT_BACKOFF_UNTIL
+    raw = (retry_after_header or "").strip()
+    try:
+        wait = float(raw) if raw else GT_BACKOFF_DEFAULT_S
+    except ValueError:
+        wait = GT_BACKOFF_DEFAULT_S
+    wait = max(30.0, min(GT_BACKOFF_CAP_S, wait))
+    until = time.time() + wait
+    if until > _GT_BACKOFF_UNTIL:
+        _GT_BACKOFF_UNTIL = until
+        log.info("geckoterminal global backoff %.0fs after 429", wait)
+
 def _gt_get(path, *, _retried=False):
-    """GET GeckoTerminal; one short retry on HTTP 429 (Retry-After capped). Shared per-minute budget."""
+    """GET GeckoTerminal; one short retry on HTTP 429 (Retry-After capped). Shared per-minute budget + global backoff."""
+    global _GT_BACKOFF_UNTIL
     now = time.time()
+    # Same-request 429 retry may proceed; other alerts honor the cool-down.
+    if not _retried and now < _GT_BACKOFF_UNTIL:
+        raise GtHttpError("rate_limited", "geckoterminal global backoff")
     while _GT_CALLS and now - _GT_CALLS[0] > 60:
         _GT_CALLS.popleft()
     if len(_GT_CALLS) >= GT_MAX_PER_MIN:
@@ -238,6 +265,9 @@ def _gt_get(path, *, _retried=False):
             log.info("geckoterminal HTTP 429; retrying once after %.1fs", wait)
             time.sleep(wait)
             return _gt_get(path, _retried=True)
+        # Arm global cool-down only after the one retry is exhausted so this lookup
+        # can still finish its remaining pools/ohlcv calls; other alerts will wait.
+        _gt_arm_backoff(r.headers.get("Retry-After") or "")
         raise GtHttpError("rate_limited", "geckoterminal HTTP 429")
     if r.status_code == 404:
         raise GtHttpError("not_on_gt", "geckoterminal HTTP 404")
@@ -288,6 +318,77 @@ def gt_ath(mint):
     _GT_CACHE[mint] = (time.time() + ttl, out)
     return out
 
+
+def _ds_pairs(mint):
+    """Fetch DexScreener pairs for mint with a polite per-minute budget. Returns list (maybe empty)."""
+    now = time.time()
+    while _DS_CALLS and now - _DS_CALLS[0] > 60:
+        _DS_CALLS.popleft()
+    if len(_DS_CALLS) >= DS_MAX_PER_MIN:
+        raise IOError("dexscreener local rate limit")
+    _DS_CALLS.append(now)
+    r = requests.get(f"{DS_URL}/{mint}", timeout=10, headers={"Accept": "application/json"})
+    if r.status_code != 200:
+        raise IOError(f"dexscreener HTTP {r.status_code}")
+    data = r.json()
+    return data if isinstance(data, list) else (data.get("pairs") or [])
+
+def ds_ath(mint):
+    """Approximate recent-peak market cap from DexScreener when GT cannot.
+    DS exposes no historical ATH; use max(current MC, MC implied from priceChange lookbacks).
+    That estimates recent peak from lookback endpoints — labeled (DS), not claimed as exchange ATH.
+    Returns (ath or None, note) where note is 'ds' | 'not_indexed' | 'ds_error'. Never raises."""
+    hit = _DS_CACHE.get(mint)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    try:
+        pairs = _ds_pairs(mint)
+        if not pairs:
+            out = (None, "not_indexed")
+        else:
+            def liq(p):
+                try: return float(((p.get("liquidity") or {}).get("usd")) or 0)
+                except (TypeError, ValueError): return 0.0
+            pair = max(pairs, key=liq)
+            try:
+                mc = float(pair.get("marketCap") or pair.get("fdv") or 0) or None
+            except (TypeError, ValueError):
+                mc = None
+            ath_field = None
+            for k, v in pair.items():
+                if isinstance(k, str) and "ath" in k.lower() and v is not None:
+                    try:
+                        ath_field = float(v); break
+                    except (TypeError, ValueError):
+                        pass
+            cands = []
+            if ath_field and ath_field > 0:
+                cands.append(ath_field)
+            ch = pair.get("priceChange") if isinstance(pair.get("priceChange"), dict) else {}
+            implied = []
+            if mc and mc > 0 and ch:
+                for pct in ch.values():
+                    try:
+                        pct = float(pct)
+                    except (TypeError, ValueError):
+                        continue
+                    denom = 1.0 + pct / 100.0
+                    if denom > 0.01:
+                        implied.append(mc / denom)
+            if ath_field and ath_field > 0:
+                out = (max([ath_field] + ([mc] if mc else []) + implied), "ds")
+            elif implied and mc:
+                out = (max([mc] + implied), "ds")
+            else:
+                # Bare current MC alone is not an ATH — stay honest.
+                out = (None, "not_indexed")
+    except Exception as e:
+        log.info("dexscreener ATH for %s failed: %s", mint[:8], str(e)[:80])
+        out = (None, "ds_error")
+    ttl = DS_CACHE_OK_S if out[0] is not None else DS_NEG_CACHE_S
+    _DS_CACHE[mint] = (time.time() + ttl, out)
+    return out
+
 def coin_info(mint):
     sym = mc = ath = None; pf_blocked = pf_failed = False
     try:
@@ -315,10 +416,17 @@ def coin_info(mint):
         _ATH_NOTE.pop(mint, None)
     if ath is None:
         if mint:
-            # Always try GT when we have a mint; label the GT reason (never mask it as pump.fun blocked).
+            # Try GT first; on GT miss + pump.fun failed, try DexScreener recent-peak estimate.
             g, note = gt_ath(mint)
             if g is not None:
                 ath = max(g, mc or 0); _ATH_NOTE[mint] = "gt"
+            elif pf_failed:
+                d, dnote = ds_ath(mint)
+                if d is not None:
+                    ath = max(d, mc or 0); _ATH_NOTE[mint] = "ds"
+                else:
+                    # Prefer DS/not-indexed over leaving a GT rate-limit label after DS was tried.
+                    _ATH_NOTE[mint] = dnote if dnote in ("not_indexed", "ds_error") else (dnote or note)
             else:
                 _ATH_NOTE[mint] = note
         elif pf_blocked:
@@ -338,14 +446,20 @@ def _token_block(sym, mint, mc, ath):
     ca = f"<code>{E(mint)}</code>" if mint else "(mint not resolved)"
     note = _ATH_NOTE.get(mint)
     if ath:
-        athv = f"~{E(compact(ath))} (GT)" if note == "gt" else E(compact(ath))
+        if note == "gt":
+            athv = f"~{E(compact(ath))} (GT)"
+        elif note == "ds":
+            athv = f"~{E(compact(ath))} (DS)"
+        else:
+            athv = E(compact(ath))
     else:
-        # Honest labels: GT failure reason wins when GT was attempted; "pump.fun blocked" only if GT was not.
+        # Honest labels. After DS fallback, prefer not-indexed over a stale GT rate-limit.
         athv = {
             "blocked": "n/a (pump.fun blocked)",
             "rate_limited": "n/a (GT rate-limited)",
             "not_on_gt": "n/a (not on GT)",
-            "not_indexed": "n/a (not on GT)",   # legacy note from older cache/code
+            "not_indexed": "n/a (not indexed)",
+            "ds_error": "n/a (not indexed)",
             "gt_error": "n/a (GT error)",
             "error": "n/a (GT error)",
         }.get(note, "n/a")
